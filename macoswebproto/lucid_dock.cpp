@@ -139,14 +139,14 @@ struct IconRuntime {
     double last_image_y = -1.0;
     int last_dot_x = -1;
     int last_dot_y = -1;
-    int panel_x = -1;
+    double panel_x = -1.0;
     bool is_open = false;
 
     // A separator drawn immediately before this item. Owned here rather than in
     // a parallel list so it cannot fall out of step with the icon order.
     bool divider_before = false;
     GtkWidget* divider = nullptr;
-    int divider_x = -1;
+    double divider_x = -1.0;
 
     // Resolved once at build time so the icon can be re-rasterised at a new
     // scale factor without redoing theme lookup. Exactly one is set.
@@ -746,6 +746,38 @@ class DockEngine {
   public:
     DockEngine() = default;
 
+    // Pin the toplevel to the full monitor width. Both dimensions have to be
+    // set together and every time: passing -1 for the width to "only change the
+    // height" clears the pin, the window auto-sizes down to the panel, and
+    // centring against that width parks the dock at the left edge. That is
+    // exactly what a config reload used to do.
+    //
+    // Fallback path only -- under layer-shell the compositor owns the size, and
+    // the pin exists because without it the toplevel renegotiates its surface
+    // size with the compositor on every magnification frame, which halves the
+    // frame rate.
+    void apply_window_size() {
+        if (window_ == nullptr || layer_shell_active_) {
+            return;
+        }
+
+        int pinned_width = 1920;
+        if (GdkDisplay* display = gdk_display_get_default()) {
+            if (GListModel* monitors = gdk_display_get_monitors(display)) {
+                if (auto* monitor = static_cast<GdkMonitor*>(g_list_model_get_item(monitors, 0))) {
+                    GdkRectangle geometry;
+                    gdk_monitor_get_geometry(monitor, &geometry);
+                    if (geometry.width > 0) {
+                        pinned_width = geometry.width;
+                    }
+                    g_object_unref(monitor);
+                }
+            }
+        }
+
+        gtk_widget_set_size_request(window_, pinned_width, window_height());
+    }
+
         void build_ui(GtkApplication* app, const DockConfig& config,
                       const std::vector<DesktopApp>& dock_apps) {
         config_ = config;
@@ -768,22 +800,7 @@ class DockEngine {
         // with the compositor every frame -- a round-trip per frame, which halves
         // the frame rate. Under layer-shell the compositor owns the size and this
         // cannot happen, so the pin is skipped there.
-        if (!layer_shell_active_) {
-            int pinned_width = 1920;
-            if (GdkDisplay* d = gdk_display_get_default()) {
-                if (GListModel* monitors = gdk_display_get_monitors(d)) {
-                    if (auto* m = static_cast<GdkMonitor*>(g_list_model_get_item(monitors, 0))) {
-                        GdkRectangle geom;
-                        gdk_monitor_get_geometry(m, &geom);
-                        if (geom.width > 0) {
-                            pinned_width = geom.width;
-                        }
-                        g_object_unref(m);
-                    }
-                }
-            }
-            gtk_widget_set_size_request(window_, pinned_width, window_height());
-        }
+        apply_window_size();
         // Width is not ours to choose: anchored left+right, the compositor gives
         // us the output width. -1 means "no opinion" rather than a guess that is
         // wrong on every display that is not 1280 logical pixels wide.
@@ -1198,6 +1215,16 @@ class DockEngine {
         return widths;
     }
 
+    // An icon's WIDTH has to be a whole number of pixels -- it is a raster size.
+    // Its POSITION does not, and deriving positions from the rounded widths is
+    // what made the dock twitch under a slowly moving pointer: one icon's
+    // rounding flipping by 1 px shifted every icon after it, and integer
+    // division for the centre shifted the whole panel again. Creeping the
+    // pointer 0.5 px per frame moved icons by up to 2 px, on half of all frames.
+    //
+    // So sizes are quantised and positions are not. Positions accumulate from
+    // the unrounded widths and are placed with gtk_fixed_move(), which takes
+    // doubles. Same 0.5 px pointer move now moves icons 0.5 px.
     void layout_panel() {
         std::vector<int> pixel_widths;
         pixel_widths.reserve(icons_.size());
@@ -1206,28 +1233,37 @@ class DockEngine {
             pixel_widths.push_back(std::max(1, static_cast<int>(std::round(icon.current_width))));
         }
 
+        double content_width = 0.0;
+        for (std::size_t i = 0; i < icons_.size(); ++i) {
+            if (i > 0 && icons_[i].divider_before) {
+                content_width += DIVIDER_SLOT;
+            }
+            content_width += icons_[i].current_width;
+            if (i + 1 < icons_.size()) {
+                content_width += ITEM_GAP;
+            }
+        }
+        panel_content_width_ = content_width;
+
         const bool widths_changed = pixel_widths != last_applied_pixel_widths_;
 
-        if (widths_changed) {
-            int panel_width = PANEL_PADDING_X * 2;
-            for (std::size_t i = 0; i < icons_.size(); ++i) {
-                const int pixel_width = pixel_widths[i];
-                gtk_widget_set_size_request(icons_[i].button, pixel_width, ITEM_SLOT_HEIGHT);
-                gtk_image_set_pixel_size(GTK_IMAGE(icons_[i].image), pixel_width);
-                if (i > 0 && icons_[i].divider_before) {
-                    panel_width += DIVIDER_SLOT;
-                }
-                panel_width += pixel_width;
-                if (i + 1 < icons_.size()) {
-                    panel_width += ITEM_GAP;
+        {
+            const int panel_width =
+                static_cast<int>(std::round(content_width)) + PANEL_PADDING_X * 2;
+
+            if (widths_changed) {
+                for (std::size_t i = 0; i < icons_.size(); ++i) {
+                    gtk_widget_set_size_request(icons_[i].button, pixel_widths[i], ITEM_SLOT_HEIGHT);
+                    gtk_image_set_pixel_size(GTK_IMAGE(icons_[i].image), pixel_widths[i]);
                 }
             }
 
-            panel_content_width_ = std::max(0, panel_width - PANEL_PADDING_X * 2);
-
             const int panel_height = ITEM_SLOT_HEIGHT + PANEL_PADDING_Y * 2;
-            gtk_widget_set_size_request(panel_fixed_, panel_width, panel_height);
-            gtk_widget_set_size_request(panel_bg_, panel_width, PANEL_BG_HEIGHT);
+            if (panel_width != last_applied_panel_width_) {
+                last_applied_panel_width_ = panel_width;
+                gtk_widget_set_size_request(panel_fixed_, panel_width, panel_height);
+                gtk_widget_set_size_request(panel_bg_, panel_width, PANEL_BG_HEIGHT);
+            }
 
             // Centre against the width we actually have. The old code took
             // max(actual, 1280), so on any display narrower than 1280 logical
@@ -1244,7 +1280,10 @@ class DockEngine {
                 return;
             }
 
-            panel_x_ = std::max(0, (win_w - panel_width) / 2);
+            // Centred in floating point: quantising this to whole pixels makes
+            // the entire dock hop sideways every time the panel's rounded width
+            // ticks over.
+            panel_x_ = std::max(0.0, (win_w - (content_width + PANEL_PADDING_X * 2)) / 2.0);
 
             // The panel sits BOTTOM_MARGIN above the screen edge and is only
             // tall enough for an unmagnified icon. Everything else is placed
@@ -1256,8 +1295,8 @@ class DockEngine {
             panel_y_ = icon_baseline_y_ -
                        (PANEL_PADDING_Y + ITEM_SLOT_HEIGHT - ICON_BOTTOM_INSET);
 
-            gtk_fixed_move(GTK_FIXED(root_fixed_), panel_bg_, static_cast<double>(panel_x_), static_cast<double>(panel_bg_y_));
-            gtk_fixed_move(GTK_FIXED(root_fixed_), panel_fixed_, static_cast<double>(panel_x_), static_cast<double>(panel_y_));
+            gtk_fixed_move(GTK_FIXED(root_fixed_), panel_bg_, panel_x_, static_cast<double>(panel_bg_y_));
+            gtk_fixed_move(GTK_FIXED(root_fixed_), panel_fixed_, panel_x_, static_cast<double>(panel_y_));
 
             // LUCID_DOCK_GEOM=1 dumps the vertical layout once. The dock's
             // geometry is the part that has been wrong most often and it is
@@ -1286,26 +1325,32 @@ class DockEngine {
             const int divider_y = (panel_bg_y_ - panel_y_) + PANEL_PADDING_Y;
             const int divider_height = PANEL_BG_HEIGHT - PANEL_PADDING_Y * 2;
 
-            int cursor = PANEL_PADDING_X;
+            // A twentieth of a pixel is under the threshold of anything the
+            // compositor can draw differently, and skipping those saves a
+            // widget move per icon per frame.
+            constexpr double kPositionEpsilon = 0.05;
+
+            double cursor = PANEL_PADDING_X;
             for (std::size_t i = 0; i < icons_.size(); ++i) {
                 auto& icon = icons_[i];
 
                 if (i > 0 && icon.divider_before && icon.divider != nullptr) {
-                    const int line_x = cursor + DIVIDER_MARGIN;
-                    if (icon.divider_x != line_x) {
+                    const double line_x = cursor + DIVIDER_MARGIN;
+                    if (std::abs(icon.divider_x - line_x) > kPositionEpsilon) {
                         icon.divider_x = line_x;
                         gtk_widget_set_size_request(icon.divider, DIVIDER_WIDTH, divider_height);
                         gtk_fixed_move(GTK_FIXED(panel_fixed_), icon.divider,
-                                       static_cast<double>(line_x), static_cast<double>(divider_y));
+                                       line_x, static_cast<double>(divider_y));
                     }
                     cursor += DIVIDER_SLOT;
                 }
 
-                if (icon.panel_x != cursor) {
+                if (std::abs(icon.panel_x - cursor) > kPositionEpsilon) {
                     icon.panel_x = cursor;
-                    gtk_fixed_move(GTK_FIXED(panel_fixed_), icon.button, static_cast<double>(cursor), static_cast<double>(PANEL_PADDING_Y));
+                    gtk_fixed_move(GTK_FIXED(panel_fixed_), icon.button, cursor,
+                                   static_cast<double>(PANEL_PADDING_Y));
                 }
-                cursor += pixel_widths[i] + ITEM_GAP;
+                cursor += icon.current_width + ITEM_GAP;
             }
 
             last_applied_pixel_widths_ = std::move(pixel_widths);
@@ -1654,9 +1699,7 @@ class DockEngine {
 
         magnifier_.configure(config_.max_scale);
         geom_logged_ = false;   // geometry may have moved; let it print again
-        if (window_ != nullptr && !layer_shell_active_) {
-            gtk_widget_set_size_request(window_, -1, window_height());
-        }
+        apply_window_size();
 
         if (items_changed) {
             rebuild_items();
@@ -1773,12 +1816,13 @@ window {
     std::vector<gint64> bench_frame_us_;
     std::vector<gint64> bench_layout_us_;
 
-    int panel_x_ = 0;
+    double panel_x_ = 0.0;
     int panel_y_ = 0;
     bool geom_logged_ = false;
     int panel_bg_y_ = 0;
     int icon_baseline_y_ = 0;
-    int panel_content_width_ = 0;
+    double panel_content_width_ = 0.0;
+    int last_applied_panel_width_ = -1;
 };
 
 void on_activate(GtkApplication* app, gpointer) {

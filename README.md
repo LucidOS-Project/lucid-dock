@@ -148,6 +148,31 @@ way the result is written to disk, so from the second run GNOME is never
 consulted again. Verified by running with `XDG_DATA_DIRS` pointed at an empty
 directory: previously exit 133, now it starts and picks six sensible apps.
 
+### Two layout bugs the config work exposed
+
+**The dock jumped to the left edge on any config change.** Reload called
+`gtk_widget_set_size_request(window_, -1, height)` to update only the height,
+but `-1` does not mean "leave the width alone", it means "no width request" --
+so it cleared the monitor-width pin, the window auto-sized down to the panel,
+and centring against *that* width put the dock at x = 0. Both dimensions are now
+set together in one `apply_window_size()` that build and reload both call.
+
+**Icons twitched under a slowly moving pointer.** An icon's width has to be a
+whole number of pixels -- it is a raster size -- but positions were being
+accumulated from those *rounded* widths, so one icon's rounding flipping by 1 px
+shifted every icon after it, and integer division for the centre shifted the
+whole panel again. Creeping the pointer 0.5 px per frame:
+
+| | largest single-frame jump | frames stepping >= 1 px |
+|---|---|---|
+| positions from rounded widths | 2.00 px | **51%** |
+| positions in floating point | 0.50 px | 0% |
+
+Sizes are quantised, positions are not: they accumulate from the unrounded
+widths and go through `gtk_fixed_move()`, which takes doubles. Moving every icon
+every frame instead of only on a rounding change costs nothing measurable --
+`layout_panel()` p50 0.088 ms, still 60 fps.
+
 ## Right-click menu
 
 Right-click anywhere on the dock: Magnification, Edit Configuration File…,
