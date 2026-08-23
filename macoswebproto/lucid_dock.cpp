@@ -1,6 +1,9 @@
 #include <gtk/gtk.h>
 
-#if defined(HAVE_GTK4_LAYER_SHELL) && __has_include(<gtk4-layer-shell.h>)
+#if defined(HAVE_GTK4_LAYER_SHELL)
+#if !__has_include(<gtk4-layer-shell.h>)
+#error "HAVE_GTK4_LAYER_SHELL is defined but <gtk4-layer-shell.h> is missing. Install gtk4-layer-shell (NOT libgtk-layer-shell-dev, which is the GTK3 build)."
+#endif
 #include <gtk4-layer-shell.h>
 #endif
 
@@ -33,12 +36,23 @@ constexpr int ITEM_SLOT_HEIGHT = 128;
 constexpr int DOT_SIZE = 4;
 constexpr int BOTTOM_MARGIN = 8;
 constexpr int WINDOW_HEIGHT = 160;
-constexpr int WINDOW_WIDTH_FALLBACK = 1280;
+
+// Icons are rasterised once at the largest size magnification can reach, then
+// scaled DOWN as they shrink. Loading at BASE_WIDTH and scaling up was the
+// cause of soft icons under magnification -- and, multiplied by the display
+// scale factor, of soft icons on HiDPI.
+constexpr int ICON_SOURCE_SIZE = static_cast<int>(MAX_WIDTH) + 1;
+
+// Time constant for magnification easing. current_width converges on
+// target_width exponentially, which is frame-rate independent and never
+// overshoots. ~55 ms reads as responsive while tracking and still gives a
+// visible settle when the pointer leaves -- the shrink animation that a
+// direct pointer-to-width mapping cannot produce.
+constexpr double MAGNIFY_TAU = 0.055;
+constexpr double WIDTH_SETTLE_EPSILON = 0.25;
 
 constexpr double BOUNCE_HEIGHT = 40.0;
 constexpr double BOUNCE_DURATION = 0.4;
-constexpr double HOVER_MOTION_EPSILON = 1.25;
-constexpr double HOVER_UPDATE_MIN_INTERVAL = 1.0 / 90.0;
 
 struct DesktopCatalogEntry {
     std::filesystem::path desktop_path;
@@ -69,15 +83,20 @@ struct IconRuntime {
     std::string icon_name;
     std::vector<std::string> process_candidates;
 
-    double current_width = BASE_WIDTH;
+    double current_width = BASE_WIDTH;   // animated
+    double target_width = BASE_WIDTH;    // where the pointer says it should be
     double bounce_offset = 0.0;
     std::optional<double> bounce_started_at;
 
-    int last_image_y = -1;
     int last_dot_x = -1;
     int last_dot_y = -1;
     int panel_x = -1;
     bool is_open = false;
+
+    // Resolved once at build time so the icon can be re-rasterised at a new
+    // scale factor without redoing theme lookup. Exactly one is set.
+    std::filesystem::path resolved_file;
+    std::string resolved_icon_name;
 };
 
 std::string to_lower_copy(std::string text) {
@@ -413,7 +432,14 @@ class DockEngine {
         gtk_window_set_decorated(GTK_WINDOW(window_), FALSE);
         gtk_window_set_resizable(GTK_WINDOW(window_), FALSE);
         gtk_widget_set_size_request(window_, -1, WINDOW_HEIGHT);
-        gtk_window_set_default_size(GTK_WINDOW(window_), WINDOW_WIDTH_FALLBACK, WINDOW_HEIGHT);
+        // Width is not ours to choose: anchored left+right, the compositor gives
+        // us the output width. -1 means "no opinion" rather than a guess that is
+        // wrong on every display that is not 1280 logical pixels wide.
+        gtk_window_set_default_size(GTK_WINDOW(window_), -1, WINDOW_HEIGHT);
+        g_signal_connect(window_, "notify::scale-factor",
+                         G_CALLBACK(&DockEngine::on_scale_changed_static), this);
+        g_signal_connect(window_, "realize",
+                         G_CALLBACK(&DockEngine::on_window_realize_static), this);
 
     #if defined(HAVE_GTK4_LAYER_SHELL)
         gtk_layer_init_for_window(GTK_WINDOW(window_));
@@ -425,9 +451,8 @@ class DockEngine {
         gtk_layer_set_keyboard_mode(GTK_WINDOW(window_), GTK_LAYER_SHELL_KEYBOARD_MODE_ON_DEMAND);
     #else
         g_warning("lucid-dock was built WITHOUT gtk4-layer-shell. The dock cannot "
-                  "anchor to the screen edge and will appear as a floating %dx%d "
-                  "window in the wrong place. Rebuild with gtk4-layer-shell.",
-                  WINDOW_WIDTH_FALLBACK, WINDOW_HEIGHT);
+                  "anchor to the screen edge and will float in the wrong place. "
+                  "Rebuild with gtk4-layer-shell.");
     #endif
 
         install_css();
@@ -463,15 +488,10 @@ class DockEngine {
 
     static void on_motion_static(GtkEventControllerMotion*, double x, double, gpointer user_data) {
         auto* self = static_cast<DockEngine*>(user_data);
-        const double now = monotonic_seconds();
-        if (self->current_mouse_x_.has_value() && std::abs(x - *self->current_mouse_x_) < HOVER_MOTION_EPSILON) {
-            if ((now - self->last_hover_layout_at_) < HOVER_UPDATE_MIN_INTERVAL) {
-                return;
-            }
-        }
-
+        // No motion throttle any more. A motion event now only updates a
+        // target; the tick callback does the work at frame rate. Throttling
+        // here was what made pointer tracking feel steppy.
         self->current_mouse_x_ = x;
-        self->last_hover_layout_at_ = now;
         self->layout_dirty_ = true;
         self->ensure_tick();
     }
@@ -523,13 +543,47 @@ class DockEngine {
         ensure_tick();
     }
 
+    // Exponential convergence toward target_width. dt-based, so the animation
+    // runs at the same speed at 60 Hz and 120 Hz. Returns true while any icon
+    // is still moving.
+    bool step_widths(double dt) {
+        const auto targets = compute_item_widths();
+        if (targets.size() != icons_.size()) {
+            return false;
+        }
+
+        const double alpha = 1.0 - std::exp(-dt / MAGNIFY_TAU);
+        bool moving = false;
+
+        for (std::size_t i = 0; i < icons_.size(); ++i) {
+            auto& icon = icons_[i];
+            icon.target_width = targets[i];
+            const double delta = icon.target_width - icon.current_width;
+
+            if (std::abs(delta) <= WIDTH_SETTLE_EPSILON) {
+                icon.current_width = icon.target_width;
+            } else {
+                icon.current_width += delta * alpha;
+                moving = true;
+            }
+        }
+
+        return moving;
+    }
+
     gboolean on_tick() {
         const double now = monotonic_seconds();
+        const double dt = last_tick_at_ > 0.0 ? std::min(0.1, now - last_tick_at_) : 1.0 / 60.0;
+        last_tick_at_ = now;
+
         bool animations_running = false;
 
         for (auto& icon : icons_) {
             animations_running = update_bounce(icon, now) || animations_running;
         }
+
+        const bool widths_moving = step_widths(dt);
+        animations_running = animations_running || widths_moving;
 
         if (layout_dirty_ || animations_running) {
             layout_panel();
@@ -541,6 +595,7 @@ class DockEngine {
         }
 
         tick_id_ = 0;
+        last_tick_at_ = 0.0;
         return G_SOURCE_REMOVE;
     }
 
@@ -569,6 +624,8 @@ class DockEngine {
         return icon.bounce_started_at.has_value();
     }
 
+    // Targets only. The animated value is integrated separately in step_widths()
+    // so that losing the pointer eases back to rest instead of snapping.
     std::vector<double> compute_item_widths() const {
         std::vector<double> widths(icons_.size(), BASE_WIDTH);
         if (!current_mouse_x_.has_value()) {
@@ -597,12 +654,11 @@ class DockEngine {
     }
 
     void layout_panel() {
-        auto widths = compute_item_widths();
         std::vector<int> pixel_widths;
-        pixel_widths.reserve(widths.size());
+        pixel_widths.reserve(icons_.size());
 
-        for (double width : widths) {
-            pixel_widths.push_back(std::max(1, static_cast<int>(std::round(width))));
+        for (const auto& icon : icons_) {
+            pixel_widths.push_back(std::max(1, static_cast<int>(std::round(icon.current_width))));
         }
 
         const bool widths_changed = pixel_widths != last_applied_pixel_widths_;
@@ -611,9 +667,13 @@ class DockEngine {
             int panel_width = PANEL_PADDING_X * 2;
             for (std::size_t i = 0; i < icons_.size(); ++i) {
                 const int pixel_width = pixel_widths[i];
-                icons_[i].current_width = static_cast<double>(pixel_width);
+                // The button still resizes: it is the hit target and it drives
+                // the panel width. The IMAGE does not -- gtk_image_set_pixel_size
+                // per frame re-rasterised every SVG at every magnification step,
+                // which on a 2x display meant re-rendering at up to 232 device
+                // pixels each frame. The image is now rendered once and scaled
+                // by a GskTransform, which is a GPU operation.
                 gtk_widget_set_size_request(icons_[i].button, pixel_width, ITEM_SLOT_HEIGHT);
-                gtk_image_set_pixel_size(GTK_IMAGE(icons_[i].image), pixel_width);
                 panel_width += pixel_width;
                 if (i + 1 < icons_.size()) {
                     panel_width += ITEM_GAP;
@@ -625,8 +685,20 @@ class DockEngine {
             const int panel_height = ITEM_SLOT_HEIGHT + PANEL_PADDING_Y * 2;
             gtk_widget_set_size_request(panel_fixed_, panel_width, panel_height);
 
-            const int win_w = std::max(gtk_widget_get_width(window_), WINDOW_WIDTH_FALLBACK);
+            // Centre against the width we actually have. The old code took
+            // max(actual, 1280), so on any display narrower than 1280 logical
+            // pixels the dock centred itself against a window that did not
+            // exist and items landed off-screen.
+            const int win_w = gtk_widget_get_width(window_);
             const int win_h = std::max(gtk_widget_get_height(window_), WINDOW_HEIGHT);
+
+            if (win_w <= 0) {
+                // Not allocated yet. Re-run once the compositor has sized us
+                // rather than laying out against a width of zero.
+                layout_dirty_ = true;
+                ensure_tick();
+                return;
+            }
 
             panel_x_ = std::max(0, (win_w - panel_width) / 2);
             panel_y_ = win_h - panel_height - BOTTOM_MARGIN;
@@ -652,20 +724,104 @@ class DockEngine {
 
     void update_icon_internal_layout(IconRuntime& icon) {
         const int pixel_width = static_cast<int>(std::round(icon.current_width));
-        const int base_y = ITEM_SLOT_HEIGHT - pixel_width - 13;
-        const int image_y = std::max(0, base_y + static_cast<int>(std::round(icon.bounce_offset)));
+        const double base_y = static_cast<double>(ITEM_SLOT_HEIGHT - pixel_width - 13);
+        const double image_y = std::max(0.0, base_y + icon.bounce_offset);
         const int dot_x = std::max(0, (pixel_width - DOT_SIZE) / 2);
         const int dot_y = ITEM_SLOT_HEIGHT - 12;
 
-        if (icon.last_image_y != image_y) {
-            icon.last_image_y = image_y;
-            gtk_fixed_move(GTK_FIXED(icon.fixed), icon.image, 0.0, static_cast<double>(image_y));
-        }
+        // Position and scale in a single GPU transform. Sub-pixel y is kept
+        // rather than rounded, so the bounce no longer steps between integers.
+        const double scale = icon.current_width / static_cast<double>(ICON_SOURCE_SIZE);
+        // GRAPHENE_POINT_INIT is a compound literal: valid to take the address
+        // of in C, an rvalue in C++. Needs a named local here.
+        const graphene_point_t offset{0.0f, static_cast<float>(image_y)};
+        GskTransform* transform = gsk_transform_translate(nullptr, &offset);
+        transform = gsk_transform_scale(transform,
+                                        static_cast<float>(scale),
+                                        static_cast<float>(scale));
+        gtk_fixed_set_child_transform(GTK_FIXED(icon.fixed), icon.image, transform);
+        gsk_transform_unref(transform);
         if (icon.last_dot_x != dot_x || icon.last_dot_y != dot_y) {
             icon.last_dot_x = dot_x;
             icon.last_dot_y = dot_y;
             gtk_fixed_move(GTK_FIXED(icon.fixed), icon.dot, static_cast<double>(dot_x), static_cast<double>(dot_y));
         }
+    }
+
+    // Current display scale, or 1 before the window is realised. GTK reports
+    // the integer scale; under fractional scaling it rounds up, which is what
+    // we want -- rasterising slightly large and scaling down stays crisp.
+    int current_scale() const {
+        const int scale = window_ != nullptr ? gtk_widget_get_scale_factor(window_) : 1;
+        return scale > 0 ? scale : 1;
+    }
+
+    // Rasterise at ICON_SOURCE_SIZE x scale so every magnification step and
+    // every display scale is a downscale rather than an upscale.
+    void apply_icon_paintable(IconRuntime& icon) {
+        const int scale = current_scale();
+        GtkIconPaintable* paintable = nullptr;
+
+        if (!icon.resolved_file.empty()) {
+            GFile* file = g_file_new_for_path(icon.resolved_file.c_str());
+            paintable = gtk_icon_paintable_new_for_file(file, ICON_SOURCE_SIZE, scale);
+            g_object_unref(file);
+        } else {
+            GdkDisplay* display = window_ != nullptr ? gtk_widget_get_display(window_)
+                                                     : gdk_display_get_default();
+            if (display != nullptr) {
+                GtkIconTheme* theme = gtk_icon_theme_get_for_display(display);
+                const char* fallbacks[] = {"application-x-executable", nullptr};
+                paintable = gtk_icon_theme_lookup_icon(
+                    theme,
+                    icon.resolved_icon_name.c_str(),
+                    fallbacks,
+                    ICON_SOURCE_SIZE,
+                    scale,
+                    GTK_TEXT_DIR_NONE,
+                    GTK_ICON_LOOKUP_FORCE_REGULAR);
+            }
+        }
+
+        if (paintable != nullptr) {
+            gtk_image_set_from_paintable(GTK_IMAGE(icon.image), GDK_PAINTABLE(paintable));
+            g_object_unref(paintable);
+        }
+    }
+
+    void reload_icons_for_scale() {
+        const int scale = current_scale();
+        if (scale == last_icon_scale_) {
+            return;
+        }
+        last_icon_scale_ = scale;
+        for (auto& icon : icons_) {
+            if (icon.image != nullptr) {
+                apply_icon_paintable(icon);
+            }
+        }
+        queue_layout();
+    }
+
+    static void on_scale_changed_static(GObject*, GParamSpec*, gpointer user_data) {
+        static_cast<DockEngine*>(user_data)->reload_icons_for_scale();
+    }
+
+    static void on_surface_size_changed_static(GObject*, GParamSpec*, gpointer user_data) {
+        static_cast<DockEngine*>(user_data)->queue_layout();
+    }
+
+    static void on_window_realize_static(GtkWidget* widget, gpointer user_data) {
+        auto* self = static_cast<DockEngine*>(user_data);
+        GdkSurface* surface = gtk_native_get_surface(GTK_NATIVE(widget));
+        if (surface != nullptr) {
+            g_signal_connect(surface, "notify::width",
+                             G_CALLBACK(&DockEngine::on_surface_size_changed_static), self);
+            g_signal_connect(surface, "notify::height",
+                             G_CALLBACK(&DockEngine::on_surface_size_changed_static), self);
+        }
+        self->reload_icons_for_scale();
+        self->queue_layout();
     }
 
     void build_icons(const std::vector<DesktopApp>& dock_apps) {
@@ -689,9 +845,8 @@ class DockEngine {
             icon.fixed = gtk_fixed_new();
             gtk_button_set_child(GTK_BUTTON(icon.button), icon.fixed);
 
-            GtkImage* image = nullptr;
             if (!icon.icon_name.empty() && std::filesystem::is_regular_file(icon.icon_name)) {
-                image = GTK_IMAGE(gtk_image_new_from_file(icon.icon_name.c_str()));
+                icon.resolved_file = icon.icon_name;
             } else {
                 std::filesystem::path theme_file = find_icon_in_lucid_theme(icon.icon_name);
                 if (theme_file.empty() && !icon.icon_name.empty()) {
@@ -702,16 +857,18 @@ class DockEngine {
                 }
 
                 if (!theme_file.empty()) {
-                    image = GTK_IMAGE(gtk_image_new_from_file(theme_file.c_str()));
-                } else if (!icon.icon_name.empty()) {
-                    image = GTK_IMAGE(gtk_image_new_from_icon_name(icon.icon_name.c_str()));
+                    icon.resolved_file = theme_file;
                 } else {
-                    image = GTK_IMAGE(gtk_image_new_from_icon_name("application-x-executable"));
+                    icon.resolved_icon_name =
+                        icon.icon_name.empty() ? "application-x-executable" : icon.icon_name;
                 }
             }
 
-            icon.image = GTK_WIDGET(image);
-            gtk_image_set_pixel_size(GTK_IMAGE(icon.image), static_cast<int>(std::round(BASE_WIDTH)));
+            icon.image = gtk_image_new();
+            apply_icon_paintable(icon);
+            // Rendered once at full size; every visual size after this is a
+            // transform, never a re-render.
+            gtk_image_set_pixel_size(GTK_IMAGE(icon.image), ICON_SOURCE_SIZE);
             gtk_fixed_put(GTK_FIXED(icon.fixed), icon.image, 0.0, 0.0);
 
             icon.dot = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
@@ -808,11 +965,12 @@ window {
     std::vector<int> last_applied_pixel_widths_;
 
     std::optional<double> current_mouse_x_;
-    double last_hover_layout_at_ = 0.0;
 
     guint tick_id_ = 0;
     guint running_refresh_id_ = 0;
     bool layout_dirty_ = false;
+    int last_icon_scale_ = 0;
+    double last_tick_at_ = 0.0;
 
     int panel_x_ = 0;
     int panel_y_ = 0;
