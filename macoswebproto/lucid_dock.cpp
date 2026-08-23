@@ -27,7 +27,8 @@
 namespace {
 
 constexpr double BASE_WIDTH = 57.6;
-constexpr double MAX_WIDTH = BASE_WIDTH * 2.0;
+constexpr double DEFAULT_MAX_SCALE = 2.0;
+constexpr double MAX_WIDTH = BASE_WIDTH * DEFAULT_MAX_SCALE;
 constexpr double DISTANCE_LIMIT = BASE_WIDTH * 6.0;
 
 constexpr int PANEL_PADDING_X = 10;
@@ -42,9 +43,17 @@ constexpr int DOT_SIZE = 4;
 // one thing in the vertical layout that never moves.
 constexpr int ICON_BOTTOM_INSET = 13;
 constexpr int BOTTOM_MARGIN = 8;
-constexpr int WINDOW_HEIGHT = 160;
 
 constexpr int BASE_ICON_PX = static_cast<int>(BASE_WIDTH + 0.5);
+
+// A separator is a hairline with generous margins. The margins are the point:
+// the line is what you see, the slot is what you can hit, and right-clicking
+// the dock needs something hittable that is not an icon. Icons magnify and
+// shove the 10 px inter-item gaps around under the pointer; this slot does not
+// magnify, so it stays the width it looks.
+constexpr int DIVIDER_WIDTH = 1;
+constexpr int DIVIDER_MARGIN = 8;
+constexpr int DIVIDER_SLOT = DIVIDER_WIDTH + DIVIDER_MARGIN * 2;
 
 // The visible panel is sized for an UNMAGNIFIED icon, not a magnified one.
 // Sizing it for the magnified case is why the idle dock was 144 px tall and
@@ -56,11 +65,11 @@ constexpr int BASE_ICON_PX = static_cast<int>(BASE_WIDTH + 0.5);
 // outside it.
 constexpr int PANEL_BG_HEIGHT = BASE_ICON_PX + DOT_SIZE + 1 + PANEL_PADDING_Y * 2;
 
-// Icons are rasterised once at the largest size magnification can reach, then
-// scaled DOWN as they shrink. Loading at BASE_WIDTH and scaling up was the
-// cause of soft icons under magnification -- and, multiplied by the display
-// scale factor, of soft icons on HiDPI.
-constexpr int ICON_SOURCE_SIZE = static_cast<int>(MAX_WIDTH) + 1;
+
+// Vertical headroom above a fully magnified icon. The launch bounce lifts an
+// icon by BOUNCE_HEIGHT, and without room for it the bounce clips against the
+// top of the surface instead of being drawn.
+constexpr int TOP_SLACK = 16;
 
 // Magnification easing is a damped spring, not exponential decay, and it is the
 // same spring in both directions. Exponential decay was the wrong model: it is
@@ -106,6 +115,7 @@ struct DesktopApp {
     std::string exec_line;
     std::vector<std::string> process_candidates;
     bool is_open = false;
+    bool divider_before = false;
 };
 
 struct IconRuntime {
@@ -131,6 +141,12 @@ struct IconRuntime {
     int last_dot_y = -1;
     int panel_x = -1;
     bool is_open = false;
+
+    // A separator drawn immediately before this item. Owned here rather than in
+    // a parallel list so it cannot fall out of step with the icon order.
+    bool divider_before = false;
+    GtkWidget* divider = nullptr;
+    int divider_x = -1;
 
     // Resolved once at build time so the icon can be re-rasterised at a new
     // scale factor without redoing theme lookup. Exactly one is set.
@@ -245,8 +261,198 @@ std::map<std::string, DesktopCatalogEntry> load_desktop_catalog() {
     return catalog;
 }
 
+// ---------------------------------------------------------------------------
+// Configuration
+//
+// GKeyFile rather than TOML or JSON: it needs no dependency GLib does not
+// already provide, and it is the syntax .desktop files are already written in,
+// so it is the one config format a Linux desktop component can assume is
+// already understood. ~/.config/lucid/ is shared with the other LucidOS
+// components so a settings app has a single directory to look in.
+// ---------------------------------------------------------------------------
+
+constexpr const char* kConfigGroup = "Dock";
+
+struct DockConfig {
+    std::vector<std::string> pinned;
+    std::vector<std::string> dividers_before;
+    bool magnification = true;
+    // Peak magnification, as a multiple of the icon size. The reference uses 2.
+    double max_scale = 2.0;
+    // Multiplier on the width spring's natural frequency. Above 1 the icons
+    // track the pointer more tightly; this is the knob for "when I sweep fast
+    // they all end up the same size", which is the spring lagging a target that
+    // is moving faster than it settles, not a shortage of magnification.
+    double tracking_speed = 1.0;
+
+    // Parsed, round-tripped and written into a fresh config file so the keys
+    // are discoverable, but not acted on yet. A settings UI needs somewhere to
+    // put these before the dock can honour them.
+    std::string layout_mode = "dock";   // dock | taskbar
+    std::string position = "bottom";    // bottom | left | right | top
+    int icon_size = 0;                  // 0 = the built-in 57.6 px
+};
+
+std::filesystem::path config_dir() {
+    const char* base = g_get_user_config_dir();
+    return std::filesystem::path(base != nullptr ? base : "") / "lucid";
+}
+
+std::filesystem::path config_file_path() {
+    return config_dir() / "dock.conf";
+}
+
+std::vector<std::string> key_string_list(GKeyFile* keyfile, const char* key) {
+    std::vector<std::string> out;
+    gsize count = 0;
+    gchar** values = g_key_file_get_string_list(keyfile, kConfigGroup, key, &count, nullptr);
+    if (values != nullptr) {
+        for (gsize i = 0; i < count; ++i) {
+            if (values[i] != nullptr && *values[i] != '\0') {
+                out.emplace_back(values[i]);
+            }
+        }
+        g_strfreev(values);
+    }
+    return out;
+}
+
+bool read_config(DockConfig& config) {
+    GKeyFile* keyfile = g_key_file_new();
+    const std::string path = config_file_path().string();
+
+    if (!g_key_file_load_from_file(keyfile, path.c_str(), G_KEY_FILE_KEEP_COMMENTS, nullptr)) {
+        g_key_file_free(keyfile);
+        return false;
+    }
+
+    config.pinned = key_string_list(keyfile, "Pinned");
+    config.dividers_before = key_string_list(keyfile, "DividersBefore");
+
+    GError* error = nullptr;
+    const gboolean magnification =
+        g_key_file_get_boolean(keyfile, kConfigGroup, "Magnification", &error);
+    if (error == nullptr) {
+        config.magnification = magnification != FALSE;
+    } else {
+        g_clear_error(&error);
+    }
+
+    for (const auto& [key, target, lo, hi] : {
+             std::tuple<const char*, double*, double, double>{"MaxScale", &config.max_scale, 1.0, 3.0},
+             std::tuple<const char*, double*, double, double>{"TrackingSpeed", &config.tracking_speed, 0.25, 4.0}}) {
+        const double value = g_key_file_get_double(keyfile, kConfigGroup, key, &error);
+        if (error == nullptr) {
+            *target = std::clamp(value, lo, hi);
+        } else {
+            g_clear_error(&error);
+        }
+    }
+
+    const int icon_size = g_key_file_get_integer(keyfile, kConfigGroup, "IconSize", &error);
+    if (error == nullptr) {
+        config.icon_size = icon_size;
+    } else {
+        g_clear_error(&error);
+    }
+
+    for (const auto& [key, target] : {std::pair<const char*, std::string*>{"LayoutMode", &config.layout_mode},
+                                      std::pair<const char*, std::string*>{"Position", &config.position}}) {
+        gchar* value = g_key_file_get_string(keyfile, kConfigGroup, key, nullptr);
+        if (value != nullptr) {
+            *target = value;
+            g_free(value);
+        }
+    }
+
+    g_key_file_free(keyfile);
+    return true;
+}
+
+void set_key_string_list(GKeyFile* keyfile, const char* key, const std::vector<std::string>& values) {
+    std::vector<const gchar*> raw;
+    raw.reserve(values.size());
+    for (const auto& value : values) {
+        raw.push_back(value.c_str());
+    }
+    g_key_file_set_string_list(keyfile, kConfigGroup, key, raw.data(), raw.size());
+}
+
+bool write_config(const DockConfig& config) {
+    std::error_code ec;
+    std::filesystem::create_directories(config_dir(), ec);
+    if (ec) {
+        g_warning("Could not create %s: %s", config_dir().c_str(), ec.message().c_str());
+        return false;
+    }
+
+    GKeyFile* keyfile = g_key_file_new();
+    set_key_string_list(keyfile, "Pinned", config.pinned);
+    set_key_string_list(keyfile, "DividersBefore", config.dividers_before);
+    g_key_file_set_boolean(keyfile, kConfigGroup, "Magnification", config.magnification ? TRUE : FALSE);
+    g_key_file_set_double(keyfile, kConfigGroup, "MaxScale", config.max_scale);
+    g_key_file_set_double(keyfile, kConfigGroup, "TrackingSpeed", config.tracking_speed);
+    g_key_file_set_integer(keyfile, kConfigGroup, "IconSize", config.icon_size);
+    g_key_file_set_string(keyfile, kConfigGroup, "LayoutMode", config.layout_mode.c_str());
+    g_key_file_set_string(keyfile, kConfigGroup, "Position", config.position.c_str());
+
+    g_key_file_set_comment(keyfile, kConfigGroup, "Pinned",
+        " Desktop file IDs, in the order they appear on the dock.", nullptr);
+    g_key_file_set_comment(keyfile, kConfigGroup, "DividersBefore",
+        " Draw a separator immediately before each of these.", nullptr);
+    g_key_file_set_comment(keyfile, kConfigGroup, "MaxScale",
+        " Peak magnification, 1.0 to 3.0. The reference dock uses 2.0.", nullptr);
+    g_key_file_set_comment(keyfile, kConfigGroup, "TrackingSpeed",
+        " How tightly icons follow the pointer, 0.25 to 4.0. Raise this if a\n"
+        " fast sweep leaves every icon looking the same size.", nullptr);
+    g_key_file_set_comment(keyfile, kConfigGroup, "IconSize",
+        " 0 means the built-in default. NOT YET HONOURED -- reserved.", nullptr);
+    g_key_file_set_comment(keyfile, kConfigGroup, "LayoutMode",
+        " dock | taskbar. NOT YET HONOURED -- reserved.", nullptr);
+    g_key_file_set_comment(keyfile, kConfigGroup, "Position",
+        " bottom | left | right | top. NOT YET HONOURED -- reserved.", nullptr);
+    g_key_file_set_comment(keyfile, nullptr, nullptr,
+        " lucid-dock configuration. Edited live: saving this file re-reads it.", nullptr);
+
+    GError* error = nullptr;
+    const std::string path = config_file_path().string();
+    const gboolean ok = g_key_file_save_to_file(keyfile, path.c_str(), &error);
+    if (!ok && error != nullptr) {
+        g_warning("Could not write %s: %s", path.c_str(), error->message);
+        g_error_free(error);
+    }
+
+    g_key_file_free(keyfile);
+    return ok != FALSE;
+}
+
+// Is a GSettings schema actually installed? g_settings_new() on a missing
+// schema is a g_error(), which aborts the process -- so this is not a style
+// preference, it is the difference between running and not. The dock used to
+// call g_settings_new("org.gnome.shell") unguarded, which meant it died on
+// launch on KDE, sway, Hyprland and COSMIC: every compositor where layer-shell
+// actually works.
+bool gsettings_schema_installed(const char* schema_id) {
+    GSettingsSchemaSource* source = g_settings_schema_source_get_default();
+    if (source == nullptr) {
+        return false;
+    }
+
+    GSettingsSchema* schema = g_settings_schema_source_lookup(source, schema_id, TRUE);
+    if (schema == nullptr) {
+        return false;
+    }
+
+    g_settings_schema_unref(schema);
+    return true;
+}
+
 std::vector<std::string> get_gnome_favorite_desktop_ids() {
     std::vector<std::string> favorites;
+
+    if (!gsettings_schema_installed("org.gnome.shell")) {
+        return favorites;
+    }
 
     GSettings* settings = g_settings_new("org.gnome.shell");
     if (settings == nullptr) {
@@ -324,9 +530,74 @@ std::filesystem::path find_icon_in_lucid_theme(const std::string& icon_name) {
     return {};
 }
 
-std::vector<DesktopApp> load_system_dock_apps() {
-    const auto catalog = load_desktop_catalog();
-    const auto favorites = get_gnome_favorite_desktop_ids();
+// What to pin when there is no config file and no GNOME to borrow from. One
+// entry per role, first match wins, anything not installed is skipped -- so
+// this produces a short, sane dock on KDE or sway rather than an empty one.
+std::vector<std::string> builtin_default_pinned(
+    const std::map<std::string, DesktopCatalogEntry>& catalog) {
+    static const std::vector<std::vector<std::string>> kRoles = {
+        {"org.gnome.Nautilus.desktop", "nautilus.desktop", "org.kde.dolphin.desktop",
+         "thunar.desktop", "nemo.desktop", "pcmanfm.desktop"},
+        {"firefox.desktop", "firefox_firefox.desktop", "org.mozilla.firefox.desktop",
+         "chromium.desktop", "chromium-browser.desktop", "google-chrome.desktop"},
+        {"org.gnome.Terminal.desktop", "org.gnome.Console.desktop", "org.kde.konsole.desktop",
+         "alacritty.desktop", "kitty.desktop", "xterm.desktop"},
+        {"org.gnome.TextEditor.desktop", "gedit.desktop", "org.kde.kate.desktop",
+         "code.desktop"},
+        {"org.gnome.Software.desktop", "org.kde.discover.desktop", "snap-store.desktop"},
+        {"org.gnome.Settings.desktop", "gnome-control-center.desktop", "systemsettings.desktop"},
+    };
+
+    std::vector<std::string> pinned;
+    for (const auto& role : kRoles) {
+        for (const auto& candidate : role) {
+            if (catalog.find(candidate) != catalog.end()) {
+                pinned.push_back(candidate);
+                break;
+            }
+        }
+    }
+    return pinned;
+}
+
+// Read the config, creating it on first run. Seeded from GNOME's favourites
+// when that schema exists -- so the dock keeps looking the way it did on a
+// GNOME box -- and from builtin_default_pinned() when it does not. Either way
+// the result is written to disk, so from the second run on there is exactly
+// one source of truth and GNOME is no longer consulted at all.
+DockConfig ensure_config(const std::map<std::string, DesktopCatalogEntry>& catalog) {
+    DockConfig config;
+    if (read_config(config)) {
+        return config;
+    }
+
+    config.pinned = get_gnome_favorite_desktop_ids();
+    const char* source = "GNOME favourites";
+    if (config.pinned.empty()) {
+        config.pinned = builtin_default_pinned(catalog);
+        source = "installed-application defaults";
+    }
+
+    // Drop anything that is not actually installed, so a first run never
+    // produces slots for applications that cannot launch.
+    std::vector<std::string> present;
+    for (const auto& desktop_id : config.pinned) {
+        if (catalog.find(desktop_id) != catalog.end()) {
+            present.push_back(desktop_id);
+        }
+    }
+    config.pinned = std::move(present);
+
+    if (write_config(config)) {
+        g_message("Created %s from %s (%zu applications).",
+                  config_file_path().c_str(), source, config.pinned.size());
+    }
+    return config;
+}
+
+std::vector<DesktopApp> load_dock_apps(const DockConfig& config,
+                                       const std::map<std::string, DesktopCatalogEntry>& catalog) {
+    const auto& favorites = config.pinned;
     const auto running_names = collect_running_process_names();
 
     std::vector<DesktopApp> apps;
@@ -346,6 +617,10 @@ std::vector<DesktopApp> load_system_dock_apps() {
             return running_names.find(candidate) != running_names.end();
         });
 
+        const bool divider_before =
+            std::find(config.dividers_before.begin(), config.dividers_before.end(), desktop_id) !=
+            config.dividers_before.end();
+
         apps.push_back(DesktopApp{
             .app_id = app_id,
             .title = entry.title,
@@ -354,6 +629,7 @@ std::vector<DesktopApp> load_system_dock_apps() {
             .exec_line = entry.exec_line,
             .process_candidates = candidates,
             .is_open = is_open,
+            .divider_before = divider_before,
         });
     }
 
@@ -362,25 +638,30 @@ std::vector<DesktopApp> load_system_dock_apps() {
 
 class MagnificationProfile {
   public:
-    MagnificationProfile()
-        : distance_input_{
-              -DISTANCE_LIMIT,
-              -DISTANCE_LIMIT / 1.25,
-              -DISTANCE_LIMIT / 2.0,
-              0.0,
-              DISTANCE_LIMIT / 2.0,
-              DISTANCE_LIMIT / 1.25,
-              DISTANCE_LIMIT,
-          },
-          width_output_{
-              BASE_WIDTH,
-              BASE_WIDTH * 1.1,
-              BASE_WIDTH * 1.414,
-              MAX_WIDTH,
-              BASE_WIDTH * 1.414,
-              BASE_WIDTH * 1.1,
-              BASE_WIDTH,
-          } {}
+    MagnificationProfile() { configure(DEFAULT_MAX_SCALE); }
+
+    // The reference's width curve is BASE * {1, 1.1, 1.414, 2} across the
+    // half-width of the falloff. Expressed as a fraction of the peak excursion
+    // that is {0, 0.1, 0.414, 1}, which generalises to any peak scale and
+    // reproduces the reference exactly at 2.0.
+    void configure(double max_scale) {
+        static const double kShape[4] = {0.0, 0.1, 0.414, 1.0};
+        const double excursion = BASE_WIDTH * (max_scale - 1.0);
+
+        distance_input_ = {
+            -DISTANCE_LIMIT, -DISTANCE_LIMIT / 1.25, -DISTANCE_LIMIT / 2.0, 0.0,
+            DISTANCE_LIMIT / 2.0, DISTANCE_LIMIT / 1.25, DISTANCE_LIMIT,
+        };
+        width_output_ = {
+            BASE_WIDTH + kShape[0] * excursion,
+            BASE_WIDTH + kShape[1] * excursion,
+            BASE_WIDTH + kShape[2] * excursion,
+            BASE_WIDTH + kShape[3] * excursion,
+            BASE_WIDTH + kShape[2] * excursion,
+            BASE_WIDTH + kShape[1] * excursion,
+            BASE_WIDTH + kShape[0] * excursion,
+        };
+    }
 
     double interpolate_width(double distance) const {
         if (distance <= distance_input_.front() || distance >= distance_input_.back()) {
@@ -465,7 +746,10 @@ class DockEngine {
   public:
     DockEngine() = default;
 
-        void build_ui(GtkApplication* app, const std::vector<DesktopApp>& dock_apps) {
+        void build_ui(GtkApplication* app, const DockConfig& config,
+                      const std::vector<DesktopApp>& dock_apps) {
+        config_ = config;
+        magnifier_.configure(config_.max_scale);
         window_ = gtk_application_window_new(app);
         gtk_window_set_title(GTK_WINDOW(window_), "Lucid Dock C++");
         gtk_window_set_decorated(GTK_WINDOW(window_), FALSE);
@@ -498,12 +782,12 @@ class DockEngine {
                     }
                 }
             }
-            gtk_widget_set_size_request(window_, pinned_width, WINDOW_HEIGHT);
+            gtk_widget_set_size_request(window_, pinned_width, window_height());
         }
         // Width is not ours to choose: anchored left+right, the compositor gives
         // us the output width. -1 means "no opinion" rather than a guess that is
         // wrong on every display that is not 1280 logical pixels wide.
-        gtk_window_set_default_size(GTK_WINDOW(window_), -1, WINDOW_HEIGHT);
+        gtk_window_set_default_size(GTK_WINDOW(window_), -1, window_height());
         g_signal_connect(window_, "notify::scale-factor",
                          G_CALLBACK(&DockEngine::on_scale_changed_static), this);
         g_signal_connect(window_, "realize",
@@ -554,6 +838,22 @@ class DockEngine {
         g_signal_connect(motion, "leave", G_CALLBACK(&DockEngine::on_leave_static), this);
         gtk_widget_add_controller(root_fixed_, motion);
 
+        // Secondary click in the CAPTURE phase, so it is seen before the item
+        // buttons get a chance at it. Right-click therefore works anywhere on
+        // the dock, icons included -- which it has to, because the only parts
+        // that are not an icon are 10 px strips that the icons shove around as
+        // they magnify. When icons grow their own context menu they can claim
+        // this in the bubble phase and the dock menu keeps the background and
+        // the separators.
+        GtkGesture* secondary = gtk_gesture_click_new();
+        gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(secondary), GDK_BUTTON_SECONDARY);
+        gtk_event_controller_set_propagation_phase(GTK_EVENT_CONTROLLER(secondary), GTK_PHASE_CAPTURE);
+        g_signal_connect(secondary, "pressed", G_CALLBACK(&DockEngine::on_secondary_press_static), this);
+        gtk_widget_add_controller(root_fixed_, GTK_EVENT_CONTROLLER(secondary));
+
+        install_menu();
+        watch_config();
+
         g_signal_connect(window_, "map", G_CALLBACK(&DockEngine::on_map_static), this);
 
         running_refresh_id_ = g_timeout_add_seconds(4, &DockEngine::on_running_refresh_static, this);
@@ -589,6 +889,16 @@ class DockEngine {
     // macos-web has no such region: `.dock-container` is pointer-events: none
     // and only `.dock-el`, the panel itself, is pointer-events: auto, so
     // mouseleave fires at the panel edge. This is that, in a hit test.
+    // Everything that depends on the configured peak magnification. The
+    // surface has to be tall enough to draw a magnified icon and its bounce,
+    // so raising MaxScale grows the window rather than clipping the icons.
+    double max_icon_width() const { return BASE_WIDTH * config_.max_scale; }
+    int max_icon_px() const { return static_cast<int>(max_icon_width() + 0.5); }
+    int icon_source_size() const { return max_icon_px() + 1; }
+    int window_height() const {
+        return PANEL_BG_HEIGHT + (max_icon_px() - BASE_ICON_PX) + BOTTOM_MARGIN + TOP_SLACK;
+    }
+
     bool pointer_is_on_panel(double x, double y) const {
         if (panel_content_width_ <= 0) {
             return false;
@@ -616,7 +926,7 @@ class DockEngine {
         // of the panel: the BOTTOM_MARGIN strip underneath is the screen edge,
         // and a dock you cannot hit by slamming the pointer into the bottom of
         // the screen is a dock you have to aim at.
-        const double bottom = std::max(gtk_widget_get_height(window_), WINDOW_HEIGHT);
+        const double bottom = std::max(gtk_widget_get_height(window_), window_height());
         return y >= top && y <= bottom;
     }
 
@@ -700,8 +1010,9 @@ class DockEngine {
             return false;
         }
 
-        const double sigma = SPRING_ZETA * SPRING_OMEGA;                  // decay rate
-        const double omega_d = SPRING_OMEGA * std::sqrt(1.0 - SPRING_ZETA * SPRING_ZETA);
+        const double omega = SPRING_OMEGA * config_.tracking_speed;
+        const double sigma = SPRING_ZETA * omega;                         // decay rate
+        const double omega_d = omega * std::sqrt(1.0 - SPRING_ZETA * SPRING_ZETA);
         const double decay = std::exp(-sigma * dt);
         const double cos_wd = std::cos(omega_d * dt);
         const double sin_wd = std::sin(omega_d * dt);
@@ -857,7 +1168,7 @@ class DockEngine {
     // so that losing the pointer eases back to rest instead of snapping.
     std::vector<double> compute_item_widths() const {
         std::vector<double> widths(icons_.size(), BASE_WIDTH);
-        if (!current_mouse_x_.has_value()) {
+        if (!current_mouse_x_.has_value() || !config_.magnification) {
             return widths;
         }
 
@@ -874,6 +1185,9 @@ class DockEngine {
             next.reserve(widths.size());
 
             for (std::size_t i = 0; i < widths.size(); ++i) {
+                if (i > 0 && icons_[i].divider_before) {
+                    cursor += DIVIDER_SLOT;
+                }
                 const double center_x = cursor + widths[i] / 2.0;
                 next[i] = magnifier_.interpolate_width(pointer_x - center_x);
                 cursor += widths[i] + ITEM_GAP;
@@ -900,6 +1214,9 @@ class DockEngine {
                 const int pixel_width = pixel_widths[i];
                 gtk_widget_set_size_request(icons_[i].button, pixel_width, ITEM_SLOT_HEIGHT);
                 gtk_image_set_pixel_size(GTK_IMAGE(icons_[i].image), pixel_width);
+                if (i > 0 && icons_[i].divider_before) {
+                    panel_width += DIVIDER_SLOT;
+                }
                 panel_width += pixel_width;
                 if (i + 1 < icons_.size()) {
                     panel_width += ITEM_GAP;
@@ -917,7 +1234,7 @@ class DockEngine {
             // pixels the dock centred itself against a window that did not
             // exist and items landed off-screen.
             const int win_w = gtk_widget_get_width(window_);
-            const int win_h = std::max(gtk_widget_get_height(window_), WINDOW_HEIGHT);
+            const int win_h = std::max(gtk_widget_get_height(window_), window_height());
 
             if (win_w <= 0) {
                 // Not allocated yet. Re-run once the compositor has sized us
@@ -954,17 +1271,36 @@ class DockEngine {
                 g_print("icon baseline     : y %d\n", icon_baseline_y_);
                 g_print("idle icon top     : y %d  (inside the panel)\n",
                         icon_baseline_y_ - BASE_ICON_PX);
-                g_print("magnified top     : y %d  (%d px above the panel)\n",
-                        icon_baseline_y_ - static_cast<int>(MAX_WIDTH),
-                        panel_bg_y_ - (icon_baseline_y_ - static_cast<int>(MAX_WIDTH)));
+                g_print("magnified top     : y %d  (%d px above the panel, scale %.2f)\n",
+                        icon_baseline_y_ - max_icon_px(),
+                        panel_bg_y_ - (icon_baseline_y_ - max_icon_px()),
+                        config_.max_scale);
                 g_print("item row (no draw): y %d .. %d\n",
                         panel_y_, panel_y_ + panel_height);
                 g_print("screen-edge gap   : %d px\n", win_h - (panel_bg_y_ + PANEL_BG_HEIGHT));
             }
 
+            // Separators span the drawn panel's interior, not the item slot:
+            // the slot is tall enough for a magnified icon, and a separator
+            // that tall would stick out of the panel along with the icons.
+            const int divider_y = (panel_bg_y_ - panel_y_) + PANEL_PADDING_Y;
+            const int divider_height = PANEL_BG_HEIGHT - PANEL_PADDING_Y * 2;
+
             int cursor = PANEL_PADDING_X;
             for (std::size_t i = 0; i < icons_.size(); ++i) {
                 auto& icon = icons_[i];
+
+                if (i > 0 && icon.divider_before && icon.divider != nullptr) {
+                    const int line_x = cursor + DIVIDER_MARGIN;
+                    if (icon.divider_x != line_x) {
+                        icon.divider_x = line_x;
+                        gtk_widget_set_size_request(icon.divider, DIVIDER_WIDTH, divider_height);
+                        gtk_fixed_move(GTK_FIXED(panel_fixed_), icon.divider,
+                                       static_cast<double>(line_x), static_cast<double>(divider_y));
+                    }
+                    cursor += DIVIDER_SLOT;
+                }
+
                 if (icon.panel_x != cursor) {
                     icon.panel_x = cursor;
                     gtk_fixed_move(GTK_FIXED(panel_fixed_), icon.button, static_cast<double>(cursor), static_cast<double>(PANEL_PADDING_Y));
@@ -1012,7 +1348,7 @@ class DockEngine {
         return scale > 0 ? scale : 1;
     }
 
-    // Rasterise at ICON_SOURCE_SIZE x scale so every magnification step and
+    // Rasterise at icon_source_size() x scale so every magnification step and
     // every display scale is a downscale rather than an upscale.
     void apply_icon_paintable(IconRuntime& icon) {
         const int scale = current_scale();
@@ -1020,7 +1356,7 @@ class DockEngine {
 
         if (!icon.resolved_file.empty()) {
             GFile* file = g_file_new_for_path(icon.resolved_file.c_str());
-            paintable = gtk_icon_paintable_new_for_file(file, ICON_SOURCE_SIZE, scale);
+            paintable = gtk_icon_paintable_new_for_file(file, icon_source_size(), scale);
             g_object_unref(file);
         } else {
             GdkDisplay* display = window_ != nullptr ? gtk_widget_get_display(window_)
@@ -1032,7 +1368,7 @@ class DockEngine {
                     theme,
                     icon.resolved_icon_name.c_str(),
                     fallbacks,
-                    ICON_SOURCE_SIZE,
+                    icon_source_size(),
                     scale,
                     GTK_TEXT_DIR_NONE,
                     GTK_ICON_LOOKUP_FORCE_REGULAR);
@@ -1092,6 +1428,7 @@ class DockEngine {
             icon.icon_name = app.icon_name;
             icon.process_candidates = app.process_candidates;
             icon.is_open = app.is_open;
+            icon.divider_before = app.divider_before;
 
             icon.button = gtk_button_new();
             gtk_widget_add_css_class(icon.button, "dock-item");
@@ -1133,6 +1470,12 @@ class DockEngine {
 
             gtk_fixed_put(GTK_FIXED(panel_fixed_), icon.button, 0.0, 0.0);
 
+            if (icon.divider_before) {
+                icon.divider = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+                gtk_widget_add_css_class(icon.divider, "dock-divider");
+                gtk_fixed_put(GTK_FIXED(panel_fixed_), icon.divider, 0.0, 0.0);
+            }
+
             icons_.push_back(std::move(icon));
             IconRuntime& new_icon = icons_.back();
             g_signal_connect(new_icon.button, "clicked", G_CALLBACK(&DockEngine::on_icon_clicked_static), &new_icon);
@@ -1152,6 +1495,188 @@ class DockEngine {
             icon.is_open = is_open;
             gtk_widget_set_visible(icon.dot, is_open ? TRUE : FALSE);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Configuration menu and live reload
+    //
+    // The config file is the only source of truth. The menu does not hold
+    // settings in memory and hand them out -- it writes the file, and the file
+    // is what everything reads. That is what keeps a settings application
+    // honest later: it edits the same file, the dock notices, and neither side
+    // needs to know the other exists. No IPC, no D-Bus, no protocol.
+    //
+    // Reload never writes, so a write cannot trigger a write. No loop, and no
+    // need to suppress our own file-monitor events.
+    // -----------------------------------------------------------------------
+
+    void install_menu() {
+        actions_ = g_simple_action_group_new();
+
+        GSimpleAction* magnification = g_simple_action_new_stateful(
+            "magnification", nullptr, g_variant_new_boolean(config_.magnification ? TRUE : FALSE));
+        g_signal_connect(magnification, "change-state",
+                         G_CALLBACK(&DockEngine::on_magnification_action_static), this);
+        g_action_map_add_action(G_ACTION_MAP(actions_), G_ACTION(magnification));
+        g_object_unref(magnification);
+
+        for (const auto& [name, handler] : {
+                 std::pair<const char*, GCallback>{"edit-config", G_CALLBACK(&DockEngine::on_edit_config_static)},
+                 std::pair<const char*, GCallback>{"reload-config", G_CALLBACK(&DockEngine::on_reload_config_static)},
+                 std::pair<const char*, GCallback>{"quit", G_CALLBACK(&DockEngine::on_quit_action_static)}}) {
+            GSimpleAction* action = g_simple_action_new(name, nullptr);
+            g_signal_connect(action, "activate", handler, this);
+            g_action_map_add_action(G_ACTION_MAP(actions_), G_ACTION(action));
+            g_object_unref(action);
+        }
+
+        gtk_widget_insert_action_group(window_, "dock", G_ACTION_GROUP(actions_));
+
+        GMenu* menu = g_menu_new();
+
+        GMenu* appearance = g_menu_new();
+        g_menu_append(appearance, "Magnification", "dock.magnification");
+        g_menu_append_section(menu, nullptr, G_MENU_MODEL(appearance));
+        g_object_unref(appearance);
+
+        GMenu* configuration = g_menu_new();
+        // Stands in for "Dock Settings..." until the settings widget exists.
+        // It edits the same file the settings application will, so the entry
+        // point moves later without the plumbing underneath it changing.
+        g_menu_append(configuration, "Edit Configuration File\u2026", "dock.edit-config");
+        g_menu_append(configuration, "Reload Configuration", "dock.reload-config");
+        g_menu_append_section(menu, nullptr, G_MENU_MODEL(configuration));
+        g_object_unref(configuration);
+
+        GMenu* quit_section = g_menu_new();
+        g_menu_append(quit_section, "Quit Dock", "dock.quit");
+        g_menu_append_section(menu, nullptr, G_MENU_MODEL(quit_section));
+        g_object_unref(quit_section);
+
+        menu_ = gtk_popover_menu_new_from_model(G_MENU_MODEL(menu));
+        g_object_unref(menu);
+
+        gtk_popover_set_has_arrow(GTK_POPOVER(menu_), FALSE);
+        gtk_widget_set_halign(menu_, GTK_ALIGN_START);
+        gtk_widget_set_parent(menu_, root_fixed_);
+    }
+
+    static void on_secondary_press_static(GtkGestureClick* gesture, gint, double x, double y,
+                                          gpointer user_data) {
+        auto* self = static_cast<DockEngine*>(user_data);
+        if (self->menu_ == nullptr || !self->pointer_is_on_panel(x, y)) {
+            return;
+        }
+
+        const GdkRectangle at{static_cast<int>(x), static_cast<int>(y), 1, 1};
+        gtk_popover_set_pointing_to(GTK_POPOVER(self->menu_), &at);
+        gtk_popover_popup(GTK_POPOVER(self->menu_));
+        gtk_gesture_set_state(GTK_GESTURE(gesture), GTK_EVENT_SEQUENCE_CLAIMED);
+    }
+
+    static void on_magnification_action_static(GSimpleAction* action, GVariant* state,
+                                               gpointer user_data) {
+        auto* self = static_cast<DockEngine*>(user_data);
+        const bool enabled = g_variant_get_boolean(state) != FALSE;
+        g_simple_action_set_state(action, g_variant_new_boolean(enabled ? TRUE : FALSE));
+
+        self->config_.magnification = enabled;
+        write_config(self->config_);
+        self->queue_layout();
+    }
+
+    static void on_edit_config_static(GSimpleAction*, GVariant*, gpointer user_data) {
+        auto* self = static_cast<DockEngine*>(user_data);
+        // Make sure there is something to open before handing it to an editor.
+        if (!std::filesystem::exists(config_file_path())) {
+            write_config(self->config_);
+        }
+
+        gchar* uri = g_filename_to_uri(config_file_path().c_str(), nullptr, nullptr);
+        if (uri != nullptr) {
+            GError* error = nullptr;
+            if (!g_app_info_launch_default_for_uri(uri, nullptr, &error) && error != nullptr) {
+                g_warning("Could not open %s: %s", uri, error->message);
+                g_error_free(error);
+            }
+            g_free(uri);
+        }
+    }
+
+    static void on_reload_config_static(GSimpleAction*, GVariant*, gpointer user_data) {
+        static_cast<DockEngine*>(user_data)->reload_config();
+    }
+
+    static void on_quit_action_static(GSimpleAction*, GVariant*, gpointer user_data) {
+        auto* self = static_cast<DockEngine*>(user_data);
+        if (self->window_ != nullptr) {
+            gtk_window_close(GTK_WINDOW(self->window_));
+        }
+    }
+
+    void watch_config() {
+        GFile* file = g_file_new_for_path(config_file_path().c_str());
+        config_monitor_ = g_file_monitor_file(file, G_FILE_MONITOR_NONE, nullptr, nullptr);
+        g_object_unref(file);
+
+        if (config_monitor_ != nullptr) {
+            g_signal_connect(config_monitor_, "changed",
+                             G_CALLBACK(&DockEngine::on_config_file_changed_static), this);
+        }
+    }
+
+    static void on_config_file_changed_static(GFileMonitor*, GFile*, GFile*,
+                                              GFileMonitorEvent event, gpointer user_data) {
+        if (event != G_FILE_MONITOR_EVENT_CHANGES_DONE_HINT &&
+            event != G_FILE_MONITOR_EVENT_CREATED &&
+            event != G_FILE_MONITOR_EVENT_RENAMED) {
+            return;
+        }
+        static_cast<DockEngine*>(user_data)->reload_config();
+    }
+
+    void reload_config() {
+        DockConfig config;
+        if (!read_config(config)) {
+            return;
+        }
+
+        // Only the item list justifies tearing widgets down; everything else is
+        // a value change and can be applied in place.
+        const bool items_changed = config.pinned != config_.pinned ||
+                                   config.dividers_before != config_.dividers_before;
+        config_ = config;
+
+        if (GAction* action = g_action_map_lookup_action(G_ACTION_MAP(actions_), "magnification")) {
+            g_simple_action_set_state(G_SIMPLE_ACTION(action),
+                                      g_variant_new_boolean(config_.magnification ? TRUE : FALSE));
+        }
+
+        magnifier_.configure(config_.max_scale);
+        geom_logged_ = false;   // geometry may have moved; let it print again
+        if (window_ != nullptr && !layer_shell_active_) {
+            gtk_widget_set_size_request(window_, -1, window_height());
+        }
+
+        if (items_changed) {
+            rebuild_items();
+        }
+        queue_layout();
+    }
+
+    void rebuild_items() {
+        for (auto& icon : icons_) {
+            if (icon.divider != nullptr) {
+                gtk_fixed_remove(GTK_FIXED(panel_fixed_), icon.divider);
+            }
+            gtk_fixed_remove(GTK_FIXED(panel_fixed_), icon.button);
+        }
+        icons_.clear();
+        last_applied_pixel_widths_.clear();
+
+        const auto catalog = load_desktop_catalog();
+        build_icons(load_dock_apps(config_, catalog));
+        last_icon_scale_ = 0;
     }
 
     void install_css() {
@@ -1183,6 +1708,10 @@ window {
     min-height: 0;
     padding: 0;
     margin: 0;
+}
+
+.dock-divider {
+    background-color: rgba(20, 20, 20, 0.30);
 }
 
 .dock-panel {
@@ -1222,6 +1751,10 @@ window {
 
     std::vector<IconRuntime> icons_;
     MagnificationProfile magnifier_;
+    DockConfig config_;
+    GtkWidget* menu_ = nullptr;
+    GSimpleActionGroup* actions_ = nullptr;
+    GFileMonitor* config_monitor_ = nullptr;
     std::vector<int> last_applied_pixel_widths_;
 
     std::optional<double> current_mouse_x_;
@@ -1250,8 +1783,9 @@ window {
 
 void on_activate(GtkApplication* app, gpointer) {
     static DockEngine engine;
-    const auto dock_apps = load_system_dock_apps();
-    engine.build_ui(app, dock_apps);
+    const auto catalog = load_desktop_catalog();
+    const DockConfig config = ensure_config(catalog);
+    engine.build_ui(app, config, load_dock_apps(config, catalog));
 }
 
 }  // namespace

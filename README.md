@@ -101,6 +101,84 @@ That opens a window containing a real layer-shell compositor, with the dock
 anchored inside it. It is the only way to test the supported path short of
 logging into KWin or sway.
 
+## Configuration
+
+`~/.config/lucid/dock.conf`, GKeyFile (`.desktop`) syntax. Not GSettings: a
+schema has to be compiled into `/usr/share/glib-2.0/schemas/` to exist at all,
+which is install-time friction for a component whose pitch is "clone, build,
+run". Not TOML or JSON either — both need a dependency GLib already replaces.
+`~/.config/lucid/` is shared with the other LucidOS components so a settings
+application has one directory to look in.
+
+| Key | Meaning |
+|---|---|
+| `Pinned` | Desktop file IDs, in dock order |
+| `DividersBefore` | Draw a separator before each of these |
+| `Magnification` | On/off |
+| `MaxScale` | Peak magnification, 1.0–3.0 (reference: 2.0) |
+| `TrackingSpeed` | How tightly icons follow the pointer, 0.25–4.0 |
+| `IconSize`, `LayoutMode`, `Position` | Written and round-tripped, **not yet honoured** |
+
+**The file is the only source of truth.** The right-click menu does not hold
+settings in memory and hand them out — it writes the file, and the file is what
+gets read back. A `GFileMonitor` applies changes live, so a settings
+application later edits the same file, the dock notices, and neither side needs
+to know the other exists: no IPC, no D-Bus, no protocol to design. Reload never
+writes, so a write cannot trigger a write and there is no loop to suppress.
+
+Changing `Pinned` or `DividersBefore` rebuilds the items; everything else is
+applied in place. `MaxScale` resizes the surface rather than clipping the icons.
+
+### The dock used to crash on every compositor it was built for
+
+`load_system_dock_apps()` called `g_settings_new("org.gnome.shell")` unguarded
+to get its app list. A missing GSettings schema is a `g_error()`, which aborts:
+
+    GLib-GIO-ERROR **: Settings schema '...' is not installed
+    Trace/breakpoint trap        exit=133
+
+So on KDE, sway, Hyprland and COSMIC — every compositor where layer-shell
+actually works — the dock died before it drew a frame. It ran only on GNOME,
+the one place it cannot anchor.
+
+GNOME favourites are now an *import*, not a dependency: on first run the schema
+is probed with `g_settings_schema_source_lookup()` and used if present, and
+`builtin_default_pinned()` fills in from installed applications if not. Either
+way the result is written to disk, so from the second run GNOME is never
+consulted again. Verified by running with `XDG_DATA_DIRS` pointed at an empty
+directory: previously exit 133, now it starts and picks six sensible apps.
+
+## Right-click menu
+
+Right-click anywhere on the dock: Magnification, Edit Configuration File…,
+Reload Configuration, Quit Dock.
+
+Anywhere, deliberately — including on icons. The obvious design is macOS's,
+where the icon and the dock have separate menus, and that is still where this
+ends up. But the dock's own targets are two 10 px end caps and eleven 10 px
+inter-item gaps, 16% of an 826 px panel, and the icons *magnify as you approach*
+— so you would be aiming at a 10 px target that moves out from under the cursor
+as you reach for it. Until icons have their own menu there is nothing to
+conflict with, so the gesture takes the whole dock in the `CAPTURE` phase. When
+the icon menu lands it claims the bubble phase and the dock menu keeps the
+background and the separators.
+
+Separators help here too, which is the other reason they exist: a separator slot
+is `DIVIDER_WIDTH + 2 * DIVIDER_MARGIN` = 17 px, it does not magnify, and it
+looks like something you can click. macOS puts Dock Settings on exactly that
+target.
+
+"Edit Configuration File…" stands in for "Dock Settings…" until the settings
+widget exists. It opens the same file the settings application will write, so
+the entry point moves later without the plumbing under it changing.
+
+### Separators
+
+From the reference: `apps-config.ts` has `dock_breaks_before` and `Dock.svelte`
+renders a `.divider`. A separator spans the drawn panel's interior rather than
+the item slot — the slot is tall enough for a magnified icon, and a separator
+that tall would stick out of the panel along with the icons.
+
 ## Animation
 
 The magnification curve and its easing both come from
@@ -123,6 +201,28 @@ Release, 2x back to 1x:
 | Spring, `omega_n = 24.32` (= macos-web exactly) | 67 ms | 117 ms | 150 ms |
 | `RELEASE_TAU = 135 ms` (removed) | 94 ms | 311 ms | 622 ms |
 | `MAGNIFY_TAU = 55 ms` (removed) | 38 ms | 127 ms | 253 ms |
+
+### Magnification collapses during a fast sweep
+
+Sweeping the pointer quickly does not make the dock feel delayed — nothing
+arrives late. It makes the icons *smaller*, because each one only holds a large
+target for a few frames before the pointer has moved on, and the spring
+integrates just part of that excursion. It is amplitude attenuation, not lag:
+
+| Sweep speed | Peak reached | of full | Spread above base |
+|---|---|---|---|
+| slow drag | 112.3 px | 98% | 54.7 px |
+| normal move | 105.9 px | 92% | 48.3 px |
+| quick move | 96.3 px | 84% | 38.7 px |
+| fast flick | 83.2 px | 72% | 25.6 px |
+| very fast flick | 71.3 px | 62% | 13.7 px |
+
+The last column is what you actually see: the spread between neighbouring icons
+falls from 55 px to 14 px, so they converge on looking identical.
+
+`TrackingSpeed` is the knob for it, not `MaxScale`. At a fast flick,
+`TrackingSpeed 2.0` recovers the same 38 px of spread that `MaxScale 3.0` does,
+without making the dock permanently larger when you are moving slowly.
 
 `omega_n` is set ~23% above the reference deliberately: same spring shape, run
 a little quicker, because the reference tracks a touch lazily for a dock driven
