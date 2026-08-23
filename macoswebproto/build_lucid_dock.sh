@@ -8,16 +8,15 @@ if ! pkg-config --exists gtk4; then
     exit 1
 fi
 
-layer_shell_module=""
-if pkg-config --exists gtk4-layer-shell-0; then
-    layer_shell_module="gtk4-layer-shell-0"
-elif pkg-config --exists gtk-layer-shell-0; then
-    layer_shell_module="gtk-layer-shell-0"
-else
-    echo "Missing layer-shell development files. Install: sudo apt install libgtk-layer-shell-dev" >&2
+# Only gtk4-layer-shell-0 is usable here. gtk-layer-shell-0 is the GTK3 build:
+# linking it into a GTK4 application does not work, so it is not a fallback.
+if ! pkg-config --exists gtk4-layer-shell-0; then
+    echo "Missing gtk4-layer-shell development files." >&2
+    echo "Note: libgtk-layer-shell-dev is the GTK3 version and will NOT work." >&2
     exit 1
 fi
 
-echo "Building with $layer_shell_module"
-g++ -std=c++20 lucid_dock.cpp -o lucid_dock_cpp $(pkg-config --cflags --libs gtk4 "$layer_shell_module")
+echo "Building with gtk4-layer-shell-0 $(pkg-config --modversion gtk4-layer-shell-0)"
+g++ -std=c++20 -DHAVE_GTK4_LAYER_SHELL=1 lucid_dock.cpp -o lucid_dock_cpp \
+    $(pkg-config --cflags --libs gtk4 gtk4-layer-shell-0)
 echo "Built ./lucid_dock_cpp"

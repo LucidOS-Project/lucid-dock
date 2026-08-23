@@ -423,6 +423,11 @@ class DockEngine {
         gtk_layer_set_anchor(GTK_WINDOW(window_), GTK_LAYER_SHELL_EDGE_RIGHT, TRUE);
         gtk_layer_set_margin(GTK_WINDOW(window_), GTK_LAYER_SHELL_EDGE_BOTTOM, BOTTOM_MARGIN);
         gtk_layer_set_keyboard_mode(GTK_WINDOW(window_), GTK_LAYER_SHELL_KEYBOARD_MODE_ON_DEMAND);
+    #else
+        g_warning("lucid-dock was built WITHOUT gtk4-layer-shell. The dock cannot "
+                  "anchor to the screen edge and will appear as a floating %dx%d "
+                  "window in the wrong place. Rebuild with gtk4-layer-shell.",
+                  WINDOW_WIDTH_FALLBACK, WINDOW_HEIGHT);
     #endif
 
         install_css();
