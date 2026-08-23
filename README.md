@@ -22,8 +22,53 @@ LucidOS desktop is built around (see "Why out-of-process" below).
     cmake -S . -B build && cmake --build build
     ./build/lucid_dock_cpp
 
-Requires `libgtk-4-dev` and **`gtk4-layer-shell`** (the GTK4 version — *not*
-`libgtk-layer-shell-dev`, which is the GTK3 one and will not work here).
+Requires `libgtk-4-dev`, `libglib2.0-dev` (for `gio-unix-2.0`) and
+**`gtk4-layer-shell`** (the GTK4 version — *not* `libgtk-layer-shell-dev`, which
+is the GTK3 one and will not work here).
+
+### gtk4-layer-shell availability
+
+It is packaged, but only on recent releases. Verified against the Debian and
+Ubuntu archives:
+
+| Distro | Package | Status |
+|---|---|---|
+| Ubuntu 26.04 LTS (resolute) | `libgtk4-layer-shell-dev` 1.3.0-1 (universe) | **Available** — the LucidOS base |
+| Ubuntu 25.10 (questing) | `libgtk4-layer-shell-dev` 1.0.4-2 (universe) | Available |
+| Ubuntu 24.04 LTS / 22.04 | — | **Not packaged**, build from source |
+| Debian 13 trixie | `libgtk4-layer-shell-dev` 1.0.4-2 | Available |
+| Debian forky / sid | `libgtk4-layer-shell-dev` 1.3.0-1 | Available |
+| Arch, Fedora | `gtk4-layer-shell` | Available |
+
+So on the shipping target this is a one-line `Depends:`. Only development on a
+24.04-era host needs the source build below.
+
+### Building gtk4-layer-shell from source
+
+For hosts without the package. Installs to `~/.local`, needs no root, and is
+undone by deleting the files it lists:
+
+    git clone --depth 1 https://github.com/wmww/gtk4-layer-shell.git
+    cd gtk4-layer-shell
+    meson setup build --prefix="$HOME/.local" \
+        -Dexamples=false -Ddocs=false -Dtests=false \
+        -Dintrospection=false -Dvapi=false
+    meson compile -C build && meson install -C build
+
+`-Dintrospection=false -Dvapi=false` drops the GObject-introspection and Vala
+bindings; the dock is C++ and does not use them, and they are what pulls in
+`gobject-introspection` and `valac` as build dependencies. If `meson`/`ninja`
+are not installed either, `pip install --target=<dir> meson ninja` gets them
+without touching the system.
+
+`build_lucid_dock.sh` picks a `~/.local` install up automatically. For the CMake
+build, export `PKG_CONFIG_PATH=$HOME/.local/lib/$(gcc -dumpmachine)/pkgconfig`
+first; the rpath is then set from pkg-config, so no `LD_LIBRARY_PATH` at run
+time.
+
+Link order matters: `gtk4-layer-shell` works by shimming libwayland, so it has
+to precede it on the link line. Getting this wrong fails at run time, not link
+time. Both build files handle it.
 
 ## Compositor support
 
@@ -39,7 +84,22 @@ implement that protocol and does **not** work on GNOME:
 
 Without layer-shell the dock degrades to a plain undecorated window that cannot
 anchor to the screen edge, cannot reserve space, and is positioned by guesswork.
-That fallback is a development convenience, not a supported mode.
+That fallback is a development convenience, not a supported mode. The choice is
+made at run time via `gtk_layer_is_supported()`, so one binary built with
+layer-shell covers both cases and says which one it took.
+
+### Testing layer-shell from a GNOME session
+
+Mutter does not advertise `zwlr_layer_shell_v1` at all, so the anchored path
+cannot be exercised from a stock GNOME session. Run a nested wlroots compositor
+inside it instead:
+
+    sudo apt install labwc      # or sway, cage
+    labwc -s ./macoswebproto/lucid_dock_cpp
+
+That opens a window containing a real layer-shell compositor, with the dock
+anchored inside it. It is the only way to test the supported path short of
+logging into KWin or sway.
 
 ## Performance notes
 
@@ -48,27 +108,47 @@ Measured on a MacBook Pro (Retina, 15-inch, Mid 2015): Intel Iris Pro 5200
 
 Run the built-in benchmark with `LUCID_DOCK_BENCH=180 ./lucid_dock_cpp`. It
 sweeps a synthetic pointer across the dock and reports where the frame time
-goes. `LUCID_BENCH_IDLE=1` ticks without doing layout, to separate per-frame
+goes. It is the source of every number below. `LUCID_BENCH_IDLE=1` ticks without doing layout, to separate per-frame
 work from window and compositor cost.
 
-| Configuration | fps |
-|---|---|
-| `GSK_RENDERER=gl` | 60 |
-| `GSK_RENDERER=ngl` (GTK 4.14 default) | 30 |
-| Either renderer, idle | 60 |
+| Configuration | fps | `layout_panel()` p50 |
+|---|---|---|
+| `GSK_RENDERER=gl` (removed in GTK 4.18) | **60** | 0.071 ms |
+| `GSK_RENDERER=ngl` (GTK 4.14 default) | 30 | 0.137 ms |
+| `GSK_RENDERER=vulkan` (GTK 4.16+ default on Wayland) | **20** | 0.058 ms |
+| Any renderer, idle | 60 | — |
 
-`layout_panel()` itself costs ~0.1 ms, so layout is not the bottleneck. The
-split is entirely in the renderer: on this GPU the newer `ngl` renderer halves
-the frame rate for the dock's per-frame redraw while the older `gl` renderer
-sustains 60. **Until that is understood, launch with `GSK_RENDERER=gl` on
-pre-Gen8 Intel graphics.**
+`layout_panel()` costs ~0.1 ms in every column, so layout is not the bottleneck
+and the ranking is entirely the renderer's. Note that the fastest column is the
+one doing the *most* layout work per frame — the renderer differences dwarf
+anything the dock does.
 
-Two caveats worth verifying before relying on this:
+Vulkan here is `hasvk`, Mesa's legacy Haswell driver, which announces itself
+with *"Haswell Vulkan support is incomplete"*. On GTK 4.14, launch with
+`GSK_RENDERER=gl` on pre-Gen8 Intel graphics.
 
-- GTK 4.16 reworked the renderers and the old `gl` renderer may not exist on
-  Ubuntu 26.04. This workaround has an expiry date. *(unverified against 26.04)*
-- Renderer choice belongs in a per-GPU capability tier for the desktop as a
-  whole, not in one application. This is the same problem as visual tiers.
+**This workaround does not survive to the shipping target, and the measurement
+it rests on does not describe it either.** Both caveats are now checked:
+
+- Ubuntu 26.04 ships GTK **4.22**. The old `gl` renderer was removed in 4.18 —
+  `GSK_RENDERER=gl` there prints *"The old GL renderer has been removed"* and
+  falls back. So the workaround becomes an inert environment variable rather
+  than a broken one, which is the good version of this outcome.
+- GTK 4.16 and later default to the **Vulkan** renderer on Wayland, not `ngl`.
+  The 30 fps figure above is a measurement of a renderer that is not the default
+  on the target and cannot be selected as a workaround there either.
+
+Put together, the 60 fps column is the one that ceases to exist on the target,
+and the renderer that replaces it as the default measures **slowest of the
+three** on this GPU. The question worth answering is therefore not "why is `ngl`
+slow on GTK 4.14" — it is whether this class of GPU can drive the dock at 60 fps
+at all under GTK 4.22, where the only two candidates are `ngl` and a Vulkan
+driver that ships with a "support is incomplete" warning. That is a measurement
+to take on 26.04, not an argument to have here. Until then `GSK_RENDERER=gl`
+costs nothing on 4.14 and buys 3x over the 26.04 default.
+
+Renderer choice still belongs in a per-GPU capability tier for the desktop as a
+whole rather than in one application — the same problem as the visual tiers.
 
 ## Why out-of-process
 

@@ -437,26 +437,36 @@ class DockEngine {
         gtk_window_set_title(GTK_WINDOW(window_), "Lucid Dock C++");
         gtk_window_set_decorated(GTK_WINDOW(window_), FALSE);
         gtk_window_set_resizable(GTK_WINDOW(window_), FALSE);
-        // Pin the toplevel to the full monitor width. Without this the window
-        // auto-sizes to the dock panel, and because the panel resizes on every
-        // magnification frame the toplevel renegotiates its surface size with
-        // the compositor every frame -- a round-trip per frame, which halves
-        // the frame rate. Under layer-shell the compositor owns the size and
-        // this cannot happen; this is the fallback path doing it by hand.
-        int pinned_width = 1920;
-        if (GdkDisplay* d = gdk_display_get_default()) {
-            if (GListModel* monitors = gdk_display_get_monitors(d)) {
-                if (auto* m = static_cast<GdkMonitor*>(g_list_model_get_item(monitors, 0))) {
-                    GdkRectangle geom;
-                    gdk_monitor_get_geometry(m, &geom);
-                    if (geom.width > 0) {
-                        pinned_width = geom.width;
+    #if defined(HAVE_GTK4_LAYER_SHELL)
+        // Compile-time availability is not run-time availability: Mutter does not
+        // implement wlr-layer-shell, so a binary built with layer-shell still has
+        // to run without it on GNOME. Ask before initialising rather than letting
+        // gtk4-layer-shell warn once per property set.
+        layer_shell_active_ = gtk_layer_is_supported();
+    #endif
+
+        // Fallback path only. Pin the toplevel to the full monitor width: without
+        // it the window auto-sizes to the dock panel, and because the panel resizes
+        // on every magnification frame the toplevel renegotiates its surface size
+        // with the compositor every frame -- a round-trip per frame, which halves
+        // the frame rate. Under layer-shell the compositor owns the size and this
+        // cannot happen, so the pin is skipped there.
+        if (!layer_shell_active_) {
+            int pinned_width = 1920;
+            if (GdkDisplay* d = gdk_display_get_default()) {
+                if (GListModel* monitors = gdk_display_get_monitors(d)) {
+                    if (auto* m = static_cast<GdkMonitor*>(g_list_model_get_item(monitors, 0))) {
+                        GdkRectangle geom;
+                        gdk_monitor_get_geometry(m, &geom);
+                        if (geom.width > 0) {
+                            pinned_width = geom.width;
+                        }
+                        g_object_unref(m);
                     }
-                    g_object_unref(m);
                 }
             }
+            gtk_widget_set_size_request(window_, pinned_width, WINDOW_HEIGHT);
         }
-        gtk_widget_set_size_request(window_, pinned_width, WINDOW_HEIGHT);
         // Width is not ours to choose: anchored left+right, the compositor gives
         // us the output width. -1 means "no opinion" rather than a guess that is
         // wrong on every display that is not 1280 logical pixels wide.
@@ -467,6 +477,13 @@ class DockEngine {
                          G_CALLBACK(&DockEngine::on_window_realize_static), this);
 
     #if defined(HAVE_GTK4_LAYER_SHELL)
+        if (!layer_shell_active_) {
+            g_warning("This compositor does not implement wlr-layer-shell (Mutter "
+                      "does not, and has declined to). The dock falls back to an "
+                      "unanchored toplevel: it will not reserve space and its "
+                      "position is a guess. Use a layer-shell compositor to test "
+                      "the real path.");
+        } else {
         gtk_layer_init_for_window(GTK_WINDOW(window_));
         gtk_layer_set_layer(GTK_WINDOW(window_), GTK_LAYER_SHELL_LAYER_OVERLAY);
         gtk_layer_set_anchor(GTK_WINDOW(window_), GTK_LAYER_SHELL_EDGE_BOTTOM, TRUE);
@@ -474,6 +491,7 @@ class DockEngine {
         gtk_layer_set_anchor(GTK_WINDOW(window_), GTK_LAYER_SHELL_EDGE_RIGHT, TRUE);
         gtk_layer_set_margin(GTK_WINDOW(window_), GTK_LAYER_SHELL_EDGE_BOTTOM, BOTTOM_MARGIN);
         gtk_layer_set_keyboard_mode(GTK_WINDOW(window_), GTK_LAYER_SHELL_KEYBOARD_MODE_ON_DEMAND);
+        }
     #else
         g_warning("lucid-dock was built WITHOUT gtk4-layer-shell. The dock cannot "
                   "anchor to the screen edge and will float in the wrong place. "
@@ -1043,6 +1061,8 @@ window {
     guint tick_id_ = 0;
     guint running_refresh_id_ = 0;
     bool layout_dirty_ = false;
+    // True only when the compositor actually implements wlr-layer-shell.
+    bool layer_shell_active_ = false;
     int last_icon_scale_ = 0;
     double last_tick_at_ = 0.0;
 

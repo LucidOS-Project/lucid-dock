@@ -24,11 +24,19 @@ else()
 endif()
 
 add_executable(lucid_dock_cpp lucid_dock.cpp)
-target_link_libraries(lucid_dock_cpp PRIVATE PkgConfig::GTK4 PkgConfig::GIO_UNIX)
 
+# gtk4-layer-shell has to precede libwayland on the link line -- it works by
+# shimming libwayland, and being linked after it fails at run time ("GTK4 Layer
+# Shell may have been linked after libwayland") rather than at link time. Hence
+# this link_libraries call comes before the GTK4 one.
 if(GTK4_LAYER_SHELL_FOUND)
 	target_link_libraries(lucid_dock_cpp PRIVATE PkgConfig::GTK4_LAYER_SHELL)
 	target_compile_definitions(lucid_dock_cpp PRIVATE HAVE_GTK4_LAYER_SHELL=1)
+	# Picks up a user-prefix build of the library (see README) without needing
+	# LD_LIBRARY_PATH at run time.
+	set_target_properties(lucid_dock_cpp PROPERTIES
+		BUILD_RPATH "${GTK4_LAYER_SHELL_LIBRARY_DIRS}"
+		INSTALL_RPATH "${GTK4_LAYER_SHELL_LIBRARY_DIRS}")
 else()
 	message(WARNING
 		"Building WITHOUT layer-shell. The dock will not anchor to the screen edge, "
@@ -36,3 +44,5 @@ else()
 		"supported configuration. Install gtk4-layer-shell (NOT libgtk-layer-shell-dev, "
 		"which is the GTK3 build) and reconfigure.")
 endif()
+
+target_link_libraries(lucid_dock_cpp PRIVATE PkgConfig::GTK4 PkgConfig::GIO_UNIX)
