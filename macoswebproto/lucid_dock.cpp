@@ -33,10 +33,28 @@ constexpr double DISTANCE_LIMIT = BASE_WIDTH * 6.0;
 constexpr int PANEL_PADDING_X = 10;
 constexpr int PANEL_PADDING_Y = 8;
 constexpr int ITEM_GAP = 10;
+// The row of item slots is tall enough for a fully magnified icon. It is a
+// layout container only -- it draws nothing.
 constexpr int ITEM_SLOT_HEIGHT = 128;
 constexpr int DOT_SIZE = 4;
+// Distance from the bottom of an item slot up to the bottom of its icon. Icons
+// are bottom-anchored at this line and grow upward from it, so the line is the
+// one thing in the vertical layout that never moves.
+constexpr int ICON_BOTTOM_INSET = 13;
 constexpr int BOTTOM_MARGIN = 8;
 constexpr int WINDOW_HEIGHT = 160;
+
+constexpr int BASE_ICON_PX = static_cast<int>(BASE_WIDTH + 0.5);
+
+// The visible panel is sized for an UNMAGNIFIED icon, not a magnified one.
+// Sizing it for the magnified case is why the idle dock was 144 px tall and
+// looked like a slab: it was reserving room it only needs while you are
+// pointing at it. macOS does not reserve that room -- magnified icons simply
+// overflow above the panel, and the reference does the same thing by giving
+// .dock-el a fixed height and letting the <img> grow past it. The panel is
+// therefore a separate widget from the row of items, so the items can be drawn
+// outside it.
+constexpr int PANEL_BG_HEIGHT = BASE_ICON_PX + DOT_SIZE + 1 + PANEL_PADDING_Y * 2;
 
 // Icons are rasterised once at the largest size magnification can reach, then
 // scaled DOWN as they shrink. Loading at BASE_WIDTH and scaling up was the
@@ -59,7 +77,12 @@ constexpr int ICON_SOURCE_SIZE = static_cast<int>(MAX_WIDTH) + 1;
 // Release, 2x -> 1x: 50% in 67 ms, 90% in 117 ms, settled at 150 ms, with a 2%
 // undershoot that reads as the icon arriving rather than asymptotically giving
 // up. The previous RELEASE_TAU of 135 ms took 622 ms to get equally close.
-constexpr double SPRING_OMEGA = 24.32;  // undamped natural frequency, rad/s
+// Deliberately above the reference's 24.32: the same spring shape, run ~23%
+// quicker, because the reference tracks the pointer a touch lazily for a dock
+// you drive with a mouse rather than a trackpad. Release settles in 122 ms
+// rather than 150. Raise it further for snappier, lower for softer; the feel
+// stays the same because zeta is what sets the shape.
+constexpr double SPRING_OMEGA = 30.0;   // undamped natural frequency, rad/s
 constexpr double SPRING_ZETA = 0.783;   // damping ratio, < 1 so it settles by
                                         // arriving rather than by creeping
 constexpr double WIDTH_SETTLE_EPSILON = 0.25;   // px
@@ -514,8 +537,14 @@ class DockEngine {
         gtk_widget_add_css_class(root_fixed_, "dock-root");
         gtk_window_set_child(GTK_WINDOW(window_), root_fixed_);
 
+        // Two widgets, not one: the rounded panel that is drawn, and the row of
+        // item slots that is not. Added in this order so the items sit above
+        // the panel and can overflow past its top edge when magnified.
+        panel_bg_ = gtk_fixed_new();
+        gtk_widget_add_css_class(panel_bg_, "dock-panel");
+        gtk_fixed_put(GTK_FIXED(root_fixed_), panel_bg_, 0.0, 0.0);
+
         panel_fixed_ = gtk_fixed_new();
-        gtk_widget_add_css_class(panel_fixed_, "dock-panel");
         gtk_fixed_put(GTK_FIXED(root_fixed_), panel_fixed_, 0.0, 0.0);
 
         build_icons(dock_apps);
@@ -571,13 +600,24 @@ class DockEngine {
             return false;
         }
 
-        // Vertically the region runs from the top of the panel to the bottom of
-        // the window rather than to the bottom of the panel. The BOTTOM_MARGIN
-        // strip underneath is the screen edge, and a dock you cannot hit by
-        // slamming the pointer into the bottom of the screen is a dock you have
-        // to aim at.
+        // Vertically the region is whatever the dock currently occupies: the
+        // panel, plus however far the icons are sticking out above it right
+        // now. Using the panel alone would mean the magnified part of an icon
+        // is not part of the dock, so pointing at the big icon would shrink it.
+        // The DOM gets this for free -- an overflowing <img> is still a
+        // descendant of .dock-el, so mouseleave does not fire over it.
+        double tallest = BASE_ICON_PX;
+        for (const auto& icon : icons_) {
+            tallest = std::max(tallest, icon.current_width);
+        }
+
+        const double top = icon_baseline_y_ - tallest - PANEL_PADDING_Y;
+        // Downward it runs to the bottom of the window rather than the bottom
+        // of the panel: the BOTTOM_MARGIN strip underneath is the screen edge,
+        // and a dock you cannot hit by slamming the pointer into the bottom of
+        // the screen is a dock you have to aim at.
         const double bottom = std::max(gtk_widget_get_height(window_), WINDOW_HEIGHT);
-        return y >= static_cast<double>(panel_y_) && y <= bottom;
+        return y >= top && y <= bottom;
     }
 
     static void on_motion_static(GtkEventControllerMotion*, double x, double y, gpointer user_data) {
@@ -870,6 +910,7 @@ class DockEngine {
 
             const int panel_height = ITEM_SLOT_HEIGHT + PANEL_PADDING_Y * 2;
             gtk_widget_set_size_request(panel_fixed_, panel_width, panel_height);
+            gtk_widget_set_size_request(panel_bg_, panel_width, PANEL_BG_HEIGHT);
 
             // Centre against the width we actually have. The old code took
             // max(actual, 1280), so on any display narrower than 1280 logical
@@ -887,8 +928,39 @@ class DockEngine {
             }
 
             panel_x_ = std::max(0, (win_w - panel_width) / 2);
-            panel_y_ = win_h - panel_height - BOTTOM_MARGIN;
+
+            // The panel sits BOTTOM_MARGIN above the screen edge and is only
+            // tall enough for an unmagnified icon. Everything else is placed
+            // relative to the icon baseline inside it, so magnified icons grow
+            // up and out of the panel instead of the panel growing to contain
+            // them.
+            panel_bg_y_ = win_h - PANEL_BG_HEIGHT - BOTTOM_MARGIN;
+            icon_baseline_y_ = panel_bg_y_ + PANEL_PADDING_Y + BASE_ICON_PX;
+            panel_y_ = icon_baseline_y_ -
+                       (PANEL_PADDING_Y + ITEM_SLOT_HEIGHT - ICON_BOTTOM_INSET);
+
+            gtk_fixed_move(GTK_FIXED(root_fixed_), panel_bg_, static_cast<double>(panel_x_), static_cast<double>(panel_bg_y_));
             gtk_fixed_move(GTK_FIXED(root_fixed_), panel_fixed_, static_cast<double>(panel_x_), static_cast<double>(panel_y_));
+
+            // LUCID_DOCK_GEOM=1 dumps the vertical layout once. The dock's
+            // geometry is the part that has been wrong most often and it is
+            // invisible in a screenshot, so make it printable.
+            if (!geom_logged_ && g_getenv("LUCID_DOCK_GEOM") != nullptr) {
+                geom_logged_ = true;
+                g_print("--- lucid-dock geometry ---\n");
+                g_print("window            : %d x %d\n", win_w, win_h);
+                g_print("panel (drawn)     : y %d .. %d   height %d\n",
+                        panel_bg_y_, panel_bg_y_ + PANEL_BG_HEIGHT, PANEL_BG_HEIGHT);
+                g_print("icon baseline     : y %d\n", icon_baseline_y_);
+                g_print("idle icon top     : y %d  (inside the panel)\n",
+                        icon_baseline_y_ - BASE_ICON_PX);
+                g_print("magnified top     : y %d  (%d px above the panel)\n",
+                        icon_baseline_y_ - static_cast<int>(MAX_WIDTH),
+                        panel_bg_y_ - (icon_baseline_y_ - static_cast<int>(MAX_WIDTH)));
+                g_print("item row (no draw): y %d .. %d\n",
+                        panel_y_, panel_y_ + panel_height);
+                g_print("screen-edge gap   : %d px\n", win_h - (panel_bg_y_ + PANEL_BG_HEIGHT));
+            }
 
             int cursor = PANEL_PADDING_X;
             for (std::size_t i = 0; i < icons_.size(); ++i) {
@@ -910,7 +982,7 @@ class DockEngine {
 
     void update_icon_internal_layout(IconRuntime& icon) {
         const int pixel_width = static_cast<int>(std::round(icon.current_width));
-        const double base_y = static_cast<double>(ITEM_SLOT_HEIGHT - pixel_width - 13);
+        const double base_y = static_cast<double>(ITEM_SLOT_HEIGHT - pixel_width - ICON_BOTTOM_INSET);
         const double image_y = std::max(0.0, base_y + icon.bounce_offset);
         const int dot_x = std::max(0, (pixel_width - DOT_SIZE) / 2);
         const int dot_y = ITEM_SLOT_HEIGHT - 12;
@@ -1092,6 +1164,27 @@ window {
     background: transparent;
 }
 
+/* GtkButton brings Adwaita's background, border and shadow with it. On a
+   128 px item slot that draws a visible vertical band behind every icon --
+   harmless while the panel was tall enough to hide them, glaring now that the
+   slots stick out above it. The dock item is a hit target, not a button. */
+.dock-item,
+.dock-item:hover,
+.dock-item:active,
+.dock-item:checked,
+.dock-item:focus {
+    background-color: transparent;
+    background-image: none;
+    border-width: 0;
+    border-color: transparent;
+    box-shadow: none;
+    outline-style: none;
+    min-width: 0;
+    min-height: 0;
+    padding: 0;
+    margin: 0;
+}
+
 .dock-panel {
     background: rgba(255, 255, 255, 0.4);
     border-radius: 19px;
@@ -1124,6 +1217,7 @@ window {
   private:
     GtkWidget* window_ = nullptr;
     GtkWidget* root_fixed_ = nullptr;
+    GtkWidget* panel_bg_ = nullptr;
     GtkWidget* panel_fixed_ = nullptr;
 
     std::vector<IconRuntime> icons_;
@@ -1148,6 +1242,9 @@ window {
 
     int panel_x_ = 0;
     int panel_y_ = 0;
+    bool geom_logged_ = false;
+    int panel_bg_y_ = 0;
+    int icon_baseline_y_ = 0;
     int panel_content_width_ = 0;
 };
 

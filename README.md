@@ -119,9 +119,15 @@ Release, 2x back to 1x:
 
 | Easing | 50% | 90% | settled |
 |---|---|---|---|
-| Spring (current, = macos-web) | 67 ms | 117 ms | **150 ms** |
+| Spring, `omega_n = 30` (current) | 50 ms | 100 ms | **133 ms** |
+| Spring, `omega_n = 24.32` (= macos-web exactly) | 67 ms | 117 ms | 150 ms |
 | `RELEASE_TAU = 135 ms` (removed) | 94 ms | 311 ms | 622 ms |
 | `MAGNIFY_TAU = 55 ms` (removed) | 38 ms | 127 ms | 253 ms |
+
+`omega_n` is set ~23% above the reference deliberately: same spring shape, run
+a little quicker, because the reference tracks a touch lazily for a dock driven
+with a mouse. `zeta` is what sets the *shape*, so `omega_n` is the knob to turn
+for reaction time without changing how the motion reads.
 
 The old easing was exponential decay with a *slower* time constant on release,
 on the theory that letting go should feel like settling. That was wrong twice
@@ -136,6 +142,42 @@ The spring is integrated in closed form, not stepped. This dock runs anywhere
 between 20 and 60 fps depending on the GSK renderer (see below), and a stepped
 integrator would change the feel with the frame rate. Verified identical to
 within frame quantisation at 20, 30, 60 and 144 fps.
+
+### Panel height, and why icons overflow it
+
+The panel is sized for an **unmagnified** icon: 79 px, of which 58 px is the
+icon. Magnified icons are 115 px and simply grow out of the top of it, ending up
+49 px above the panel edge.
+
+It used to be sized for the magnified case — 144 px tall, permanently, so it
+read as a slab at idle and reserved space it only needed while being pointed at.
+That is not what macOS does, and not what the reference does either: `.dock-el`
+has a fixed height and the `<img>` inside it just overflows.
+
+Reproducing that means the drawn panel and the row of item slots are **two
+separate widgets**. `panel_bg_` carries the `.dock-panel` styling and is the
+short one; `panel_fixed_` is a tall, undrawn layout container stacked above it.
+Everything vertical is placed relative to one line — the icon baseline, where
+the bottom of every icon sits regardless of size — so icons grow upward out of
+the panel rather than the panel growing to contain them.
+
+    window            : 1440 x 160
+    panel (drawn)     : y  73 .. 152   height 79
+    icon baseline     : y 139
+    idle icon top     : y  81   (inside the panel)
+    magnified top     : y  24   (49 px above the panel)
+    item row (no draw): y  16 .. 160
+    screen-edge gap   : 8 px
+
+Run `LUCID_DOCK_GEOM=1 ./lucid_dock_cpp` to print that for the current display.
+Geometry is the part of this dock that has been wrong most often and it does not
+show up in a screenshot, so it is printable.
+
+Exposing the item slots also exposed that they were never styled: a `GtkButton`
+brings Adwaita's background, border and shadow with it, which drew a visible
+128 px vertical band behind every icon. Invisible while the panel was tall
+enough to cover them; obvious once it wasn't. The dock item is a hit target, not
+a button, and `.dock-item` now says so.
 
 ### Where magnification is allowed to happen
 
@@ -166,10 +208,15 @@ macos-web has the identical discontinuity, because `mouseleave` on `.dock-el`
 drops the pointer to "infinitely far" in one event. The pop on entry *is* the
 effect.
 
-Vertically the hit region runs to the bottom of the window rather than the
-bottom of the panel, so the `BOTTOM_MARGIN` strip still counts. A dock you
-cannot hit by slamming the pointer into the screen edge is a dock you have to
-aim at.
+Vertically the region is whatever the dock currently occupies: the panel, plus
+however far the icons are sticking out above it at that moment. The panel alone
+would mean the magnified part of an icon is not part of the dock, so pointing at
+a big icon would shrink it. The DOM gets this free — an overflowing `<img>` is
+still a descendant of `.dock-el`, so `mouseleave` does not fire over it.
+
+Downward it runs to the bottom of the window rather than the bottom of the
+panel, so the `BOTTOM_MARGIN` strip still counts. A dock you cannot hit by
+slamming the pointer into the screen edge is a dock you have to aim at.
 
 Also from the reference: app-launch bounce is 40 px over 400 ms with sine-in-out
 easing, matching `tweened(0, {duration: 400, easing: sineInOut})`. Not yet
