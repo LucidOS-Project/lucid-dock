@@ -13,6 +13,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -49,6 +50,10 @@ constexpr int ICON_SOURCE_SIZE = static_cast<int>(MAX_WIDTH) + 1;
 // visible settle when the pointer leaves -- the shrink animation that a
 // direct pointer-to-width mapping cannot produce.
 constexpr double MAGNIFY_TAU = 0.055;
+// Releasing uses a slower time constant than tracking. Following the pointer
+// wants to feel immediate; letting go wants to feel like the dock settles.
+// One tau for both made the shrink read as abrupt.
+constexpr double RELEASE_TAU = 0.135;
 constexpr double WIDTH_SETTLE_EPSILON = 0.25;
 
 constexpr double BOUNCE_HEIGHT = 40.0;
@@ -88,6 +93,7 @@ struct IconRuntime {
     double bounce_offset = 0.0;
     std::optional<double> bounce_started_at;
 
+    double last_image_y = -1.0;
     int last_dot_x = -1;
     int last_dot_y = -1;
     int panel_x = -1;
@@ -431,7 +437,26 @@ class DockEngine {
         gtk_window_set_title(GTK_WINDOW(window_), "Lucid Dock C++");
         gtk_window_set_decorated(GTK_WINDOW(window_), FALSE);
         gtk_window_set_resizable(GTK_WINDOW(window_), FALSE);
-        gtk_widget_set_size_request(window_, -1, WINDOW_HEIGHT);
+        // Pin the toplevel to the full monitor width. Without this the window
+        // auto-sizes to the dock panel, and because the panel resizes on every
+        // magnification frame the toplevel renegotiates its surface size with
+        // the compositor every frame -- a round-trip per frame, which halves
+        // the frame rate. Under layer-shell the compositor owns the size and
+        // this cannot happen; this is the fallback path doing it by hand.
+        int pinned_width = 1920;
+        if (GdkDisplay* d = gdk_display_get_default()) {
+            if (GListModel* monitors = gdk_display_get_monitors(d)) {
+                if (auto* m = static_cast<GdkMonitor*>(g_list_model_get_item(monitors, 0))) {
+                    GdkRectangle geom;
+                    gdk_monitor_get_geometry(m, &geom);
+                    if (geom.width > 0) {
+                        pinned_width = geom.width;
+                    }
+                    g_object_unref(m);
+                }
+            }
+        }
+        gtk_widget_set_size_request(window_, pinned_width, WINDOW_HEIGHT);
         // Width is not ours to choose: anchored left+right, the compositor gives
         // us the output width. -1 means "no opinion" rather than a guess that is
         // wrong on every display that is not 1280 logical pixels wide.
@@ -477,6 +502,12 @@ class DockEngine {
         running_refresh_id_ = g_timeout_add_seconds(4, &DockEngine::on_running_refresh_static, this);
         queue_layout();
 
+        if (const char* bench = g_getenv("LUCID_DOCK_BENCH")) {
+            bench_total_ = std::max(60, atoi(bench));
+            bench_remaining_ = bench_total_;
+            ensure_tick();
+        }
+
         gtk_window_present(GTK_WINDOW(window_));
     }
 
@@ -521,9 +552,9 @@ class DockEngine {
         }
     }
 
-    static gboolean on_tick_static(GtkWidget*, GdkFrameClock*, gpointer user_data) {
+    static gboolean on_tick_static(GtkWidget*, GdkFrameClock* clock, gpointer user_data) {
         auto* self = static_cast<DockEngine*>(user_data);
-        return self->on_tick();
+        return self->on_tick(clock);
     }
 
     static gboolean on_running_refresh_static(gpointer user_data) {
@@ -552,7 +583,8 @@ class DockEngine {
             return false;
         }
 
-        const double alpha = 1.0 - std::exp(-dt / MAGNIFY_TAU);
+        const double tau = current_mouse_x_.has_value() ? MAGNIFY_TAU : RELEASE_TAU;
+        const double alpha = 1.0 - std::exp(-dt / tau);
         bool moving = false;
 
         for (std::size_t i = 0; i < icons_.size(); ++i) {
@@ -571,7 +603,65 @@ class DockEngine {
         return moving;
     }
 
-    gboolean on_tick() {
+    // LUCID_DOCK_BENCH=<frames> sweeps a synthetic pointer across the dock and
+    // reports where the frame time actually goes. Measuring beats guessing:
+    // "layout" is the time inside layout_panel(), "frame" is the interval the
+    // frame clock actually achieved.
+    void bench_step(GdkFrameClock* clock) {
+        if (bench_remaining_ <= 0) {
+            return;
+        }
+
+        const double phase = static_cast<double>(bench_total_ - bench_remaining_) /
+                             static_cast<double>(bench_total_);
+        const double span = static_cast<double>(panel_content_width_ + 2 * PANEL_PADDING_X);
+        current_mouse_x_ = panel_x_ + span * (0.5 - 0.5 * std::cos(phase * 2.0 * M_PI * 3.0));
+        layout_dirty_ = true;
+
+        if (clock != nullptr) {
+            const gint64 t = gdk_frame_clock_get_frame_time(clock);
+            if (bench_last_frame_us_ > 0) {
+                bench_frame_us_.push_back(t - bench_last_frame_us_);
+            }
+            bench_last_frame_us_ = t;
+        }
+
+        if (--bench_remaining_ == 0) {
+            bench_report();
+        }
+    }
+
+    static double pct(std::vector<gint64>& v, double q) {
+        if (v.empty()) return 0.0;
+        std::sort(v.begin(), v.end());
+        const std::size_t i = std::min(v.size() - 1,
+            static_cast<std::size_t>(q * static_cast<double>(v.size() - 1)));
+        return static_cast<double>(v[i]) / 1000.0;
+    }
+
+    void bench_report() {
+        g_print("\n--- lucid-dock frame benchmark ---\n");
+        g_print("window           : %dx%d logical\n",
+                gtk_widget_get_width(window_), gtk_widget_get_height(window_));
+        g_print("icons            : %zu\n", icons_.size());
+        g_print("scale factor     : %d\n", current_scale());
+        g_print("frames measured  : %zu\n", bench_frame_us_.size());
+        g_print("layout_panel() ms: p50 %.3f  p95 %.3f  max %.3f\n",
+                pct(bench_layout_us_, 0.50), pct(bench_layout_us_, 0.95),
+                pct(bench_layout_us_, 1.0));
+        g_print("frame interval ms: p50 %.3f  p95 %.3f  max %.3f\n",
+                pct(bench_frame_us_, 0.50), pct(bench_frame_us_, 0.95),
+                pct(bench_frame_us_, 1.0));
+        const double p50 = pct(bench_frame_us_, 0.50);
+        if (p50 > 0.0) {
+            g_print("effective fps    : %.1f (p50)\n", 1000.0 / p50);
+        }
+        g_print("---------------------------------\n");
+        g_application_quit(G_APPLICATION(gtk_window_get_application(GTK_WINDOW(window_))));
+    }
+
+    gboolean on_tick(GdkFrameClock* clock) {
+        bench_step(clock);
         const double now = monotonic_seconds();
         const double dt = last_tick_at_ > 0.0 ? std::min(0.1, now - last_tick_at_) : 1.0 / 60.0;
         last_tick_at_ = now;
@@ -585,12 +675,21 @@ class DockEngine {
         const bool widths_moving = step_widths(dt);
         animations_running = animations_running || widths_moving;
 
+        if (g_getenv("LUCID_BENCH_IDLE") != nullptr) {
+            layout_dirty_ = false;
+            animations_running = false;
+        }
+
         if (layout_dirty_ || animations_running) {
+            const gint64 t0 = g_get_monotonic_time();
             layout_panel();
+            if (bench_total_ > 0) {
+                bench_layout_us_.push_back(g_get_monotonic_time() - t0);
+            }
             layout_dirty_ = false;
         }
 
-        if (animations_running || layout_dirty_) {
+        if (animations_running || layout_dirty_ || bench_remaining_ > 0) {
             return G_SOURCE_CONTINUE;
         }
 
@@ -667,13 +766,8 @@ class DockEngine {
             int panel_width = PANEL_PADDING_X * 2;
             for (std::size_t i = 0; i < icons_.size(); ++i) {
                 const int pixel_width = pixel_widths[i];
-                // The button still resizes: it is the hit target and it drives
-                // the panel width. The IMAGE does not -- gtk_image_set_pixel_size
-                // per frame re-rasterised every SVG at every magnification step,
-                // which on a 2x display meant re-rendering at up to 232 device
-                // pixels each frame. The image is now rendered once and scaled
-                // by a GskTransform, which is a GPU operation.
                 gtk_widget_set_size_request(icons_[i].button, pixel_width, ITEM_SLOT_HEIGHT);
+                gtk_image_set_pixel_size(GTK_IMAGE(icons_[i].image), pixel_width);
                 panel_width += pixel_width;
                 if (i + 1 < icons_.size()) {
                     panel_width += ITEM_GAP;
@@ -729,18 +823,16 @@ class DockEngine {
         const int dot_x = std::max(0, (pixel_width - DOT_SIZE) / 2);
         const int dot_y = ITEM_SLOT_HEIGHT - 12;
 
-        // Position and scale in a single GPU transform. Sub-pixel y is kept
-        // rather than rounded, so the bounce no longer steps between integers.
-        const double scale = icon.current_width / static_cast<double>(ICON_SOURCE_SIZE);
-        // GRAPHENE_POINT_INIT is a compound literal: valid to take the address
-        // of in C, an rvalue in C++. Needs a named local here.
-        const graphene_point_t offset{0.0f, static_cast<float>(image_y)};
-        GskTransform* transform = gsk_transform_translate(nullptr, &offset);
-        transform = gsk_transform_scale(transform,
-                                        static_cast<float>(scale),
-                                        static_cast<float>(scale));
-        gtk_fixed_set_child_transform(GTK_FIXED(icon.fixed), icon.image, transform);
-        gsk_transform_unref(transform);
+        // Deliberately NOT a GskTransform. Measured on Iris Pro 5200 at 2x:
+        // gtk_fixed_set_child_transform() per child per frame runs at 30 fps,
+        // gtk_image_set_pixel_size() at 60. A non-trivial transform makes GSK
+        // render the child into an offscreen texture, and ten offscreens a
+        // frame cost more than re-rasterising ten SVGs. Sub-pixel y is kept --
+        // that is what stops the bounce stepping between integers.
+        if (icon.last_image_y != image_y) {
+            icon.last_image_y = image_y;
+            gtk_fixed_move(GTK_FIXED(icon.fixed), icon.image, 0.0, image_y);
+        }
         if (icon.last_dot_x != dot_x || icon.last_dot_y != dot_y) {
             icon.last_dot_x = dot_x;
             icon.last_dot_y = dot_y;
@@ -866,9 +958,7 @@ class DockEngine {
 
             icon.image = gtk_image_new();
             apply_icon_paintable(icon);
-            // Rendered once at full size; every visual size after this is a
-            // transform, never a re-render.
-            gtk_image_set_pixel_size(GTK_IMAGE(icon.image), ICON_SOURCE_SIZE);
+            gtk_image_set_pixel_size(GTK_IMAGE(icon.image), static_cast<int>(std::round(BASE_WIDTH)));
             gtk_fixed_put(GTK_FIXED(icon.fixed), icon.image, 0.0, 0.0);
 
             icon.dot = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
@@ -918,24 +1008,8 @@ window {
         0 0 0 1px rgba(20, 20, 20, 0.22),
         2px 5px 19px 7px rgba(0, 0, 0, 0.3);
 }
-
-.dock-item,
-.dock-item:hover,
-.dock-item:active,
-.dock-item:focus-visible {
-    padding: 0;
-    margin: 0;
-    border: none;
-    background: transparent;
-    box-shadow: none;
-    outline: none;
-}
-
-.dock-dot {
-    border-radius: 999px;
-    background: rgba(20, 20, 20, 0.85);
-}
 )CSS";
+
 
         GtkCssProvider* provider = gtk_css_provider_new();
         gtk_css_provider_load_from_string(provider, kCss);
@@ -971,6 +1045,12 @@ window {
     bool layout_dirty_ = false;
     int last_icon_scale_ = 0;
     double last_tick_at_ = 0.0;
+
+    int bench_total_ = 0;
+    int bench_remaining_ = 0;
+    gint64 bench_last_frame_us_ = 0;
+    std::vector<gint64> bench_frame_us_;
+    std::vector<gint64> bench_layout_us_;
 
     int panel_x_ = 0;
     int panel_y_ = 0;
