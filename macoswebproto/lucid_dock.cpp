@@ -44,17 +44,26 @@ constexpr int WINDOW_HEIGHT = 160;
 // scale factor, of soft icons on HiDPI.
 constexpr int ICON_SOURCE_SIZE = static_cast<int>(MAX_WIDTH) + 1;
 
-// Time constant for magnification easing. current_width converges on
-// target_width exponentially, which is frame-rate independent and never
-// overshoots. ~55 ms reads as responsive while tracking and still gives a
-// visible settle when the pointer leaves -- the shrink animation that a
-// direct pointer-to-width mapping cannot produce.
-constexpr double MAGNIFY_TAU = 0.055;
-// Releasing uses a slower time constant than tracking. Following the pointer
-// wants to feel immediate; letting go wants to feel like the dock settles.
-// One tau for both made the shrink read as abrupt.
-constexpr double RELEASE_TAU = 0.135;
-constexpr double WIDTH_SETTLE_EPSILON = 0.25;
+// Magnification easing is a damped spring, not exponential decay, and it is the
+// same spring in both directions. Exponential decay was the wrong model: it is
+// front-loaded and then crawls, so releasing spent 300 ms covering the last 10%
+// of the distance and read as sluggish no matter what time constant was used.
+//
+// These constants reproduce macos-web's `spring({damping: 0.47, stiffness:
+// 0.12})`, which is where this dock's magnification curve came from. Svelte's
+// spring is a frame-normalised discrete integrator; solving its characteristic
+// polynomial z^2 - 1.41z + 0.53 at 60 Hz gives poles of magnitude 0.728 at
+// 0.2522 rad/frame, i.e. these continuous parameters. Reproducing them exactly
+// rather than by eye means the feel does not drift from the reference.
+//
+// Release, 2x -> 1x: 50% in 67 ms, 90% in 117 ms, settled at 150 ms, with a 2%
+// undershoot that reads as the icon arriving rather than asymptotically giving
+// up. The previous RELEASE_TAU of 135 ms took 622 ms to get equally close.
+constexpr double SPRING_OMEGA = 24.32;  // undamped natural frequency, rad/s
+constexpr double SPRING_ZETA = 0.783;   // damping ratio, < 1 so it settles by
+                                        // arriving rather than by creeping
+constexpr double WIDTH_SETTLE_EPSILON = 0.25;   // px
+constexpr double WIDTH_SETTLE_VELOCITY = 2.0;   // px/s
 
 constexpr double BOUNCE_HEIGHT = 40.0;
 constexpr double BOUNCE_DURATION = 0.4;
@@ -89,6 +98,7 @@ struct IconRuntime {
     std::vector<std::string> process_candidates;
 
     double current_width = BASE_WIDTH;   // animated
+    double width_velocity = 0.0;         // px/s, carried across frames by the spring
     double target_width = BASE_WIDTH;    // where the pointer says it should be
     double bounce_offset = 0.0;
     std::optional<double> bounce_started_at;
@@ -592,30 +602,46 @@ class DockEngine {
         ensure_tick();
     }
 
-    // Exponential convergence toward target_width. dt-based, so the animation
-    // runs at the same speed at 60 Hz and 120 Hz. Returns true while any icon
-    // is still moving.
+    // Advance the width spring by dt, using the closed-form solution of the
+    // underdamped spring rather than a stepped integrator. That matters here:
+    // a stepped integrator's behaviour depends on how often it is called, and
+    // this dock demonstrably runs anywhere between 20 and 60 fps depending on
+    // the GSK renderer, so a stepped spring would change feel with the renderer.
+    // The closed form is exact at any dt and cannot go unstable at a low one.
     bool step_widths(double dt) {
         const auto targets = compute_item_widths();
         if (targets.size() != icons_.size()) {
             return false;
         }
 
-        const double tau = current_mouse_x_.has_value() ? MAGNIFY_TAU : RELEASE_TAU;
-        const double alpha = 1.0 - std::exp(-dt / tau);
+        const double sigma = SPRING_ZETA * SPRING_OMEGA;                  // decay rate
+        const double omega_d = SPRING_OMEGA * std::sqrt(1.0 - SPRING_ZETA * SPRING_ZETA);
+        const double decay = std::exp(-sigma * dt);
+        const double cos_wd = std::cos(omega_d * dt);
+        const double sin_wd = std::sin(omega_d * dt);
         bool moving = false;
 
         for (std::size_t i = 0; i < icons_.size(); ++i) {
             auto& icon = icons_[i];
             icon.target_width = targets[i];
-            const double delta = icon.target_width - icon.current_width;
 
-            if (std::abs(delta) <= WIDTH_SETTLE_EPSILON) {
+            // Displacement from the target, and the velocity that goes with it.
+            const double a = icon.current_width - icon.target_width;
+            const double v0 = icon.width_velocity;
+
+            if (std::abs(a) <= WIDTH_SETTLE_EPSILON &&
+                std::abs(v0) <= WIDTH_SETTLE_VELOCITY) {
                 icon.current_width = icon.target_width;
-            } else {
-                icon.current_width += delta * alpha;
-                moving = true;
+                icon.width_velocity = 0.0;
+                continue;
             }
+
+            const double b = (v0 + sigma * a) / omega_d;
+            icon.current_width = icon.target_width + decay * (a * cos_wd + b * sin_wd);
+            icon.width_velocity =
+                decay * ((omega_d * b - sigma * a) * cos_wd -
+                         (omega_d * a + sigma * b) * sin_wd);
+            moving = true;
         }
 
         return moving;

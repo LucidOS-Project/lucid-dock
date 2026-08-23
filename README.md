@@ -101,6 +101,47 @@ That opens a window containing a real layer-shell compositor, with the dock
 anchored inside it. It is the only way to test the supported path short of
 logging into KWin or sway.
 
+## Animation
+
+The magnification curve and its easing both come from
+[macos-web](https://github.com/PuruVJ/macos-web) (`macoswebproto/DockItem.svelte`
+is a copy of the reference). Easing is a **damped spring, the same one in both
+directions** — matching the reference, which uses a single
+`spring({damping: 0.47, stiffness: 0.12})` for growing and shrinking alike and
+has no separate release path.
+
+The C++ constants are derived from that spring rather than tuned by eye. Svelte's
+spring is a frame-normalised discrete integrator; its characteristic polynomial
+at 60 Hz gives poles that correspond to a continuous spring of
+`omega_n = 24.32 rad/s, zeta = 0.783`, which is what `lucid_dock.cpp` uses.
+
+Release, 2x back to 1x:
+
+| Easing | 50% | 90% | settled |
+|---|---|---|---|
+| Spring (current, = macos-web) | 67 ms | 117 ms | **150 ms** |
+| `RELEASE_TAU = 135 ms` (removed) | 94 ms | 311 ms | 622 ms |
+| `MAGNIFY_TAU = 55 ms` (removed) | 38 ms | 127 ms | 253 ms |
+
+The old easing was exponential decay with a *slower* time constant on release,
+on the theory that letting go should feel like settling. That was wrong twice
+over. Exponential decay is front-loaded and then crawls — it approaches the
+target asymptotically and never arrives — so the last 10% of the shrink took
+300 ms on its own and read as sluggish. A slightly underdamped spring instead
+undershoots by 2% and comes back, which is the cue that reads as the icon
+*arriving*. Note the spring is actually slower than the old easing over the
+first half of the distance; being quicker to finish is what makes it feel fast.
+
+The spring is integrated in closed form, not stepped. This dock runs anywhere
+between 20 and 60 fps depending on the GSK renderer (see below), and a stepped
+integrator would change the feel with the frame rate. Verified identical to
+within frame quantisation at 20, 30, 60 and 144 fps.
+
+Also from the reference: app-launch bounce is 40 px over 400 ms with sine-in-out
+easing, matching `tweened(0, {duration: 400, easing: sineInOut})`. Not yet
+implemented from it: the auto-hide slide (`transform: translate3d(0, 200%, 0)`
+over 300 ms), group dividers, and the hover tooltip.
+
 ## Performance notes
 
 Measured on a MacBook Pro (Retina, 15-inch, Mid 2015): Intel Iris Pro 5200
