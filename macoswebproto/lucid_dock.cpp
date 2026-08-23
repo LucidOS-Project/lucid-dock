@@ -545,8 +545,54 @@ class DockEngine {
         self->queue_layout();
     }
 
-    static void on_motion_static(GtkEventControllerMotion*, double x, double, gpointer user_data) {
+    // Is the pointer actually on the dock panel? Coordinates are relative to
+    // root_fixed_, which spans the whole monitor -- so "the pointer is in this
+    // widget" is nowhere near the same question as "the pointer is on the dock".
+    //
+    // Getting this wrong is what made magnification feel dead. Motion anywhere
+    // in the bottom strip of the screen used to set the pointer position, and
+    // the curve reaches DISTANCE_LIMIT (6 icon widths) past the icon it is
+    // measured from, so the dock started magnifying while the cursor was still
+    // 300 px away from it. By the time the cursor arrived at the panel edge the
+    // nearest icon was already at 78% of full magnification, leaving only the
+    // last 22% to happen during the traversal you can actually see.
+    //
+    // macos-web has no such region: `.dock-container` is pointer-events: none
+    // and only `.dock-el`, the panel itself, is pointer-events: auto, so
+    // mouseleave fires at the panel edge. This is that, in a hit test.
+    bool pointer_is_on_panel(double x, double y) const {
+        if (panel_content_width_ <= 0) {
+            return false;
+        }
+
+        const double left = static_cast<double>(panel_x_);
+        const double right = left + panel_content_width_ + 2.0 * PANEL_PADDING_X;
+        if (x < left || x > right) {
+            return false;
+        }
+
+        // Vertically the region runs from the top of the panel to the bottom of
+        // the window rather than to the bottom of the panel. The BOTTOM_MARGIN
+        // strip underneath is the screen edge, and a dock you cannot hit by
+        // slamming the pointer into the bottom of the screen is a dock you have
+        // to aim at.
+        const double bottom = std::max(gtk_widget_get_height(window_), WINDOW_HEIGHT);
+        return y >= static_cast<double>(panel_y_) && y <= bottom;
+    }
+
+    static void on_motion_static(GtkEventControllerMotion*, double x, double y, gpointer user_data) {
         auto* self = static_cast<DockEngine*>(user_data);
+
+        if (!self->pointer_is_on_panel(x, y)) {
+            // Off the panel is off the dock, even though it is still inside the
+            // window. Same effect as leaving.
+            if (self->current_mouse_x_.has_value()) {
+                self->current_mouse_x_.reset();
+                self->queue_layout();
+            }
+            return;
+        }
+
         // No motion throttle any more. A motion event now only updates a
         // target; the tick callback does the work at frame rate. Throttling
         // here was what made pointer tracking feel steppy.
@@ -775,10 +821,12 @@ class DockEngine {
             return widths;
         }
 
+        // No overhang allowance here any more. This used to admit pointers up to
+        // DISTANCE_LIMIT (345 px) past either end of the panel, which is what
+        // let the dock magnify for a cursor that was nowhere near it. Whether
+        // the pointer counts at all is now pointer_is_on_panel()'s decision,
+        // and it stops at the panel edge.
         const double pointer_x = *current_mouse_x_ - panel_x_;
-        if (pointer_x < -DISTANCE_LIMIT || pointer_x > panel_content_width_ + DISTANCE_LIMIT) {
-            return widths;
-        }
 
         for (int pass = 0; pass < 2; ++pass) {
             double cursor = PANEL_PADDING_X;

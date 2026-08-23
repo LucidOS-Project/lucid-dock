@@ -137,6 +137,40 @@ between 20 and 60 fps depending on the GSK renderer (see below), and a stepped
 integrator would change the feel with the frame rate. Verified identical to
 within frame quantisation at 20, 30, 60 and 144 fps.
 
+### Where magnification is allowed to happen
+
+Only while the pointer is on the dock panel. This is a hit test rather than a
+widget boundary, because the window spans the whole monitor width under
+layer-shell and `root_fixed_` spans the window — "in the widget" is not the same
+question as "on the dock".
+
+It used to be the widget boundary, plus a `DISTANCE_LIMIT` overhang, and the
+result was that the dock magnified for a cursor up to 300 px away from it:
+
+| Cursor, relative to the dock's left edge | Leftmost icon | Magnified |
+|---|---|---|
+| 300 px away | 58.1 px | 1% |
+| 150 px away | 76.8 px | 33% |
+| 50 px away | 93.9 px | 63% |
+| at the edge | 102.7 px | **78%** |
+| over the icon | 115.2 px | 100% |
+
+So 78% of the effect was spent before the pointer reached the dock, and moving
+across the dock delivered only the remaining 22% at the ends — the magnification
+read as barely responding to the pointer, which is the symptom that led here.
+The curve amplitude was never the problem.
+
+Entering the dock is now a step change (57.6 -> 102.7 px at the left edge) that
+the spring absorbs over ~150 ms. That is not a bug and it is not a workaround:
+macos-web has the identical discontinuity, because `mouseleave` on `.dock-el`
+drops the pointer to "infinitely far" in one event. The pop on entry *is* the
+effect.
+
+Vertically the hit region runs to the bottom of the window rather than the
+bottom of the panel, so the `BOTTOM_MARGIN` strip still counts. A dock you
+cannot hit by slamming the pointer into the screen edge is a dock you have to
+aim at.
+
 Also from the reference: app-launch bounce is 40 px over 400 ms with sine-in-out
 easing, matching `tweened(0, {duration: 400, easing: sineInOut})`. Not yet
 implemented from it: the auto-hide slide (`transform: translate3d(0, 200%, 0)`
