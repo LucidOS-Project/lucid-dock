@@ -784,35 +784,38 @@ class DockEngine {
         // sprung: 1 while the pointer is on the dock, 0 when it is not. The
         // release animation and the magnification response are now independent,
         // and the fast-sweep attenuation is not a tuning problem, it is gone.
-        const double target = (last_pointer_x_.has_value() && config_.magnification) ? 1.0 : 0.0;
+        // The target comes from where the pointer IS -- current_mouse_x_ -- and
+        // never from last_pointer_x_, which is only retained to shape the decay
+        // after the pointer has gone. Deriving the target from the remembered
+        // position instead makes the two circular: the target stays 1 because
+        // the position is set, and the position is only cleared once the target
+        // reaches 0. The dock then magnifies on first hover and never shrinks.
+        const double target = (current_mouse_x_.has_value() && config_.magnification) ? 1.0 : 0.0;
 
         const double sigma = SPRING_ZETA * SPRING_OMEGA;
         const double omega_d = SPRING_OMEGA * std::sqrt(1.0 - SPRING_ZETA * SPRING_ZETA);
         const double a = envelope_ - target;
         bool moving = false;
 
-        if (std::abs(a) <= ENVELOPE_SETTLE || std::abs(envelope_velocity_) > 0.0 ||
-            std::abs(a) > ENVELOPE_SETTLE) {
-            if (std::abs(a) <= ENVELOPE_SETTLE &&
-                std::abs(envelope_velocity_) <= ENVELOPE_SETTLE_VELOCITY) {
-                envelope_ = target;
-                envelope_velocity_ = 0.0;
-                // The pointer position is only kept alive to shape the decay.
-                // Once the decay is done it is nothing but stale state.
-                if (target == 0.0) {
-                    last_pointer_x_.reset();
-                }
-            } else {
-                const double decay = std::exp(-sigma * dt);
-                const double cos_wd = std::cos(omega_d * dt);
-                const double sin_wd = std::sin(omega_d * dt);
-                const double b = (envelope_velocity_ + sigma * a) / omega_d;
-
-                envelope_ = target + decay * (a * cos_wd + b * sin_wd);
-                envelope_velocity_ = decay * ((omega_d * b - sigma * a) * cos_wd -
-                                              (omega_d * a + sigma * b) * sin_wd);
-                moving = true;
+        if (std::abs(a) <= ENVELOPE_SETTLE && std::abs(envelope_velocity_) <= ENVELOPE_SETTLE_VELOCITY) {
+            envelope_ = target;
+            envelope_velocity_ = 0.0;
+            // Retained only to shape the decay. Once the decay is finished it
+            // is nothing but stale state, and holding it would keep the dock
+            // laying out against a pointer that is no longer there.
+            if (target == 0.0) {
+                last_pointer_x_.reset();
             }
+        } else {
+            const double decay = std::exp(-sigma * dt);
+            const double cos_wd = std::cos(omega_d * dt);
+            const double sin_wd = std::sin(omega_d * dt);
+            const double b = (envelope_velocity_ + sigma * a) / omega_d;
+
+            envelope_ = target + decay * (a * cos_wd + b * sin_wd);
+            envelope_velocity_ = decay * ((omega_d * b - sigma * a) * cos_wd -
+                                          (omega_d * a + sigma * b) * sin_wd);
+            moving = true;
         }
 
         for (std::size_t i = 0; i < icons_.size(); ++i) {
@@ -834,8 +837,21 @@ class DockEngine {
 
         const double phase = static_cast<double>(bench_total_ - bench_remaining_) /
                              static_cast<double>(bench_total_);
-        const double span = static_cast<double>(panel_content_width_ + 2 * PANEL_PADDING_X);
-        current_mouse_x_ = panel_x_ + span * (0.5 - 0.5 * std::cos(phase * 2.0 * M_PI * 3.0));
+
+        // The last quarter of the run takes the pointer off the dock, so the
+        // release is measured rather than only the sweep. The dock has now
+        // twice shipped a bug where it magnified and then would not shrink --
+        // once from a 622 ms tail, once from an envelope whose target could
+        // never reach zero. Both were invisible to a benchmark that never let
+        // go of the pointer.
+        if (phase < 0.75) {
+            const double sweep = phase / 0.75;
+            const double span = static_cast<double>(panel_content_width_ + 2 * PANEL_PADDING_X);
+            current_mouse_x_ = panel_x_ + span * (0.5 - 0.5 * std::cos(sweep * 2.0 * M_PI * 3.0));
+        } else {
+            current_mouse_x_.reset();
+            hovered_index_.reset();
+        }
         layout_dirty_ = true;
 
         if (clock != nullptr) {
@@ -872,6 +888,17 @@ class DockEngine {
         g_print("frame interval ms: p50 %.3f  p95 %.3f  max %.3f\n",
                 pct(bench_frame_us_, 0.50), pct(bench_frame_us_, 0.95),
                 pct(bench_frame_us_, 1.0));
+        // Did letting go actually put it back? Reported as a fact rather than
+        // trusted, because "it magnifies" and "it un-magnifies" are separate
+        // claims and only the first one is obvious while developing.
+        double widest = 0.0;
+        for (const auto& icon : icons_) {
+            widest = std::max(widest, icon.current_width);
+        }
+        g_print("after release    : envelope %.4f, widest icon %.1f px (idle is %.1f) -- %s\n",
+                envelope_, widest, base_width_,
+                (envelope_ < 0.01 && widest <= base_width_ + 0.5) ? "SHRANK" : "STUCK MAGNIFIED");
+
         const double p50 = pct(bench_frame_us_, 0.50);
         if (p50 > 0.0) {
             g_print("effective fps    : %.1f (p50)\n", 1000.0 / p50);

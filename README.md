@@ -349,6 +349,24 @@ The pointer position is remembered after the pointer leaves, until the envelope
 finishes decaying -- otherwise the shape would snap flat and the envelope would
 be easing nothing.
 
+That remembered position is *only* the shape. The envelope's target comes from
+where the pointer is now, and deriving it from the remembered position instead
+makes the two circular -- the target stays 1 because the position is set, and
+the position is only cleared once the target reaches 0. The dock then magnifies
+on first hover and never shrinks again, which is exactly what it did.
+
+**The benchmark now lets go of the pointer.** Its last quarter runs with the
+pointer off the dock and it reports whether the icons actually returned to their
+idle size:
+
+    after release    : envelope 0.0000, widest icon 57.6 px (idle is 57.6) -- SHRANK
+
+This dock has now twice shipped a bug where it magnified and then would not come
+back -- once from a 622 ms exponential tail, once from that circular target.
+Both were invisible to a benchmark that only ever swept and never released,
+because "it magnifies" and "it un-magnifies" are separate claims and only the
+first is obvious while you are working on it.
+
 `omega_n` is set ~23% above the reference deliberately: same spring shape, run
 a little quicker, because the reference tracks a touch lazily for a dock driven
 with a mouse. `zeta` is what sets the *shape*, so `omega_n` is the knob to turn
