@@ -21,6 +21,14 @@ struct SettingsPage {
     GtkWidget* app_list = nullptr;
     GtkWidget* add_button = nullptr;
 
+    // Held so "Reset to Defaults" can put the displayed values back. Without
+    // these the config would change underneath controls still showing the old
+    // numbers.
+    GtkWidget* size_scale = nullptr;
+    GtkWidget* magnify_switch = nullptr;
+    GtkWidget* max_scale_scale = nullptr;
+    GtkWidget* spread_scale = nullptr;
+
     // Set while a control is being populated from the config, so that
     // programmatic changes do not write the file back and fight the user.
     bool loading = false;
@@ -333,6 +341,36 @@ GtkWidget* build_scale(SettingsPage* page, double lo, double hi, double step, do
     return scale;
 }
 
+// Appearance only. The pinned list is the user's own arrangement, not a
+// setting with a sensible default, and quietly discarding it because someone
+// wanted the sliders back where they started would be a bad trade.
+//
+// The defaults come from DockConfig's own member initialisers rather than being
+// written out a second time here, so there is one place they can be wrong.
+void reset_to_defaults(SettingsPage* page) {
+    const DockConfig defaults;
+
+    page->config.magnification = defaults.magnification;
+    page->config.icon_size = defaults.icon_size;
+    page->config.max_scale = defaults.max_scale;
+    page->config.spread = defaults.spread;
+
+    // Put the controls back without each one writing the file on its way.
+    page->loading = true;
+    gtk_switch_set_active(GTK_SWITCH(page->magnify_switch),
+                          defaults.magnification ? TRUE : FALSE);
+    gtk_range_set_value(GTK_RANGE(page->size_scale),
+                        defaults.icon_size > 0 ? defaults.icon_size : 58);
+    gtk_range_set_value(GTK_RANGE(page->max_scale_scale), defaults.max_scale);
+    gtk_range_set_value(GTK_RANGE(page->spread_scale), defaults.spread);
+    page->loading = false;
+
+    // The size slider cannot express "0 means the default", so re-assert it
+    // after the widget has had its say.
+    page->config.icon_size = defaults.icon_size;
+    lucid::write_config(page->config);
+}
+
 void free_page(gpointer data) {
     delete static_cast<SettingsPage*>(data);
 }
@@ -363,14 +401,14 @@ GtkWidget* lucid_dock_settings_page_new(void) {
     // Idle icon size. 0 in the file means "the default", which is not a value a
     // slider can express, so it is resolved to the default here and written out
     // as a real number the moment the user touches it.
-    gtk_box_append(
-        GTK_BOX(behaviour),
-        labelled_row("Size", "How large the icons are when nothing is hovered.",
-                     build_scale(page, 24.0, 80.0, 1.0,
-                                 page->config.icon_size > 0 ? page->config.icon_size : 58,
-                                 [](SettingsPage* p, double v) {
-                                     p->config.icon_size = static_cast<int>(v + 0.5);
-                                 })));
+    page->size_scale = build_scale(page, 24.0, 80.0, 1.0,
+                                   page->config.icon_size > 0 ? page->config.icon_size : 58,
+                                   [](SettingsPage* p, double v) {
+                                       p->config.icon_size = static_cast<int>(v + 0.5);
+                                   });
+    gtk_box_append(GTK_BOX(behaviour),
+                   labelled_row("Size", "How large the icons are when nothing is hovered.",
+                                page->size_scale));
     gtk_box_append(GTK_BOX(behaviour), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL));
 
     GtkWidget* magnify = gtk_switch_new();
@@ -384,6 +422,7 @@ GtkWidget* lucid_dock_settings_page_new(void) {
             return FALSE;
         }),
         page, nullptr, G_CONNECT_DEFAULT);
+    page->magnify_switch = magnify;
     gtk_box_append(GTK_BOX(behaviour),
                    labelled_row("Enlarge icons under the pointer", nullptr, magnify));
 
@@ -391,8 +430,9 @@ GtkWidget* lucid_dock_settings_page_new(void) {
     gtk_box_append(
         GTK_BOX(behaviour),
         labelled_row("Maximum size", "How large an icon gets at the pointer, as a multiple.",
-                     build_scale(page, 1.0, 3.0, 0.05, page->config.max_scale,
-                                 [](SettingsPage* p, double v) { p->config.max_scale = v; })));
+                     page->max_scale_scale = build_scale(
+                         page, 1.0, 3.0, 0.05, page->config.max_scale,
+                         [](SettingsPage* p, double v) { p->config.max_scale = v; })));
 
     gtk_box_append(GTK_BOX(behaviour), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL));
     gtk_box_append(
@@ -400,9 +440,24 @@ GtkWidget* lucid_dock_settings_page_new(void) {
         labelled_row("Spread",
                      "How far magnification reaches, in icon widths. Lower makes the icon "
                      "under the pointer stand out more from its neighbours.",
-                     build_scale(page, 1.5, 8.0, 0.1, page->config.spread,
-                                 [](SettingsPage* p, double v) { p->config.spread = v; })));
+                     page->spread_scale = build_scale(
+                         page, 1.5, 8.0, 0.1, page->config.spread,
+                         [](SettingsPage* p, double v) { p->config.spread = v; })));
     gtk_box_append(GTK_BOX(column), frame);
+
+    GtkWidget* reset = gtk_button_new_with_label("Reset to Defaults");
+    gtk_widget_set_halign(reset, GTK_ALIGN_END);
+    gtk_widget_set_margin_top(reset, 8);
+    gtk_widget_set_tooltip_text(reset,
+                                "Restores size, magnification and spread. Your pinned "
+                                "applications are left alone.");
+    g_signal_connect_data(
+        reset, "clicked",
+        G_CALLBACK(+[](GtkButton*, gpointer data) {
+            reset_to_defaults(static_cast<SettingsPage*>(data));
+        }),
+        page, nullptr, G_CONNECT_DEFAULT);
+    gtk_box_append(GTK_BOX(column), reset);
 
     gtk_box_append(GTK_BOX(column), section_heading("Applications"));
 

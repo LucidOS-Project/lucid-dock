@@ -199,10 +199,16 @@ writes, the dock's `GFileMonitor` notices, the change applies live. No IPC, no
 D-Bus, no protocol between the two processes, and no reason for either binary to
 know the other is running.
 
-Controls: magnification on/off, maximum size, tracking speed, and the pinned
-list with reorder, remove, add, and a per-row "Separator before" toggle -- a
+Controls: size, magnification on/off, maximum size, spread, and the pinned list
+with reorder, remove, add, and a per-row "Separator before" toggle -- a
 separator belongs to the app it precedes, so that is where the control for it
 belongs, rather than in a second list to be kept in step by hand.
+
+**Reset to Defaults** restores size, magnification and spread only. The pinned
+list is the user's own arrangement, not a setting with a sensible default, and
+discarding it because someone wanted the sliders back would be a bad trade. The
+values come from `DockConfig`'s own member initialisers rather than being
+written out a second time, so there is one place for them to be wrong.
 
 `dock_config.h` is header-only. The shared surface is a config struct, a
 `.desktop` catalogue, and the functions that read and write them; a static
