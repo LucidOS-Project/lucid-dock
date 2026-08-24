@@ -32,8 +32,13 @@ using namespace lucid;
 
 constexpr double BASE_WIDTH = 57.6;
 constexpr double DEFAULT_MAX_SCALE = 2.0;
-constexpr double MAX_WIDTH = BASE_WIDTH * DEFAULT_MAX_SCALE;
-constexpr double DISTANCE_LIMIT = BASE_WIDTH * 6.0;
+
+// Bounds the surface has to be able to contain. Configuration is clamped to
+// these so that the surface itself can be a constant -- see SURFACE_HEIGHT.
+constexpr int MIN_ICON_SIZE = 24;
+constexpr int MAX_ICON_SIZE = 80;
+constexpr double MIN_MAX_SCALE = 1.0;
+constexpr double MAX_MAX_SCALE = 3.0;
 
 constexpr int PANEL_PADDING_X = 10;
 constexpr int PANEL_PADDING_Y = 8;
@@ -48,7 +53,10 @@ constexpr int DOT_SIZE = 4;
 constexpr int ICON_BOTTOM_INSET = 13;
 constexpr int BOTTOM_MARGIN = 8;
 
-constexpr int BASE_ICON_PX = static_cast<int>(BASE_WIDTH + 0.5);
+constexpr int icon_px_for(double icon_size) { return static_cast<int>(icon_size + 0.5); }
+constexpr int panel_bg_height_for(int icon_px) {
+    return icon_px + DOT_SIZE + 1 + PANEL_PADDING_Y * 2;
+}
 
 // A separator is a hairline with generous margins. The margins are the point:
 // the line is what you see, the slot is what you can hit, and right-clicking
@@ -67,9 +75,6 @@ constexpr int DIVIDER_SLOT = DIVIDER_WIDTH + DIVIDER_MARGIN * 2;
 // .dock-el a fixed height and letting the <img> grow past it. The panel is
 // therefore a separate widget from the row of items, so the items can be drawn
 // outside it.
-constexpr int PANEL_BG_HEIGHT = BASE_ICON_PX + DOT_SIZE + 1 + PANEL_PADDING_Y * 2;
-
-
 // The name label above the hovered icon. The reference has no transition on it
 // at all -- display: none to display: block -- so it appears on the same frame
 // the pointer arrives. GTK's stock tooltip cannot do that: it waits ~500 ms by
@@ -81,6 +86,23 @@ constexpr int TOOLTIP_RESERVE = 36;     // headroom to reserve for it
 // and for the launch bounce, which lifts an icon by BOUNCE_HEIGHT and clips
 // against the top of the surface without room to move into.
 constexpr int TOP_SLACK = TOOLTIP_RESERVE + TOOLTIP_GAP + 8;
+
+// The surface is a CONSTANT size, deliberately, sized for the largest
+// configuration that will be accepted rather than for the current one.
+//
+// Sizing it to the current configuration is what made the dock walk down the
+// screen every time magnification was increased: growing the surface is only
+// free under layer-shell, where it is anchored to the bottom edge and grows
+// upward. On the fallback path the compositor owns placement, keeps the
+// window's top where it is, and the extra height comes out of the bottom -- so
+// each increase pushed the dock further down. A constant surface cannot do
+// that, on either path, and it costs only transparent pixels.
+constexpr int SURFACE_HEIGHT = panel_bg_height_for(MAX_ICON_SIZE) +
+                               static_cast<int>(MAX_ICON_SIZE * MAX_MAX_SCALE) -
+                               MAX_ICON_SIZE + BOTTOM_MARGIN + TOP_SLACK;
+
+
+
 
 // Magnification easing is a damped spring, not exponential decay, and it is the
 // same spring in both directions. Exponential decay was the wrong model: it is
@@ -105,8 +127,8 @@ constexpr int TOP_SLACK = TOOLTIP_RESERVE + TOOLTIP_GAP + 8;
 constexpr double SPRING_OMEGA = 30.0;   // undamped natural frequency, rad/s
 constexpr double SPRING_ZETA = 0.783;   // damping ratio, < 1 so it settles by
                                         // arriving rather than by creeping
-constexpr double WIDTH_SETTLE_EPSILON = 0.25;   // px
-constexpr double WIDTH_SETTLE_VELOCITY = 2.0;   // px/s
+constexpr double ENVELOPE_SETTLE = 0.001;
+constexpr double ENVELOPE_SETTLE_VELOCITY = 0.02;
 
 constexpr double BOUNCE_HEIGHT = 40.0;
 constexpr double BOUNCE_DURATION = 0.4;
@@ -271,34 +293,37 @@ std::vector<DesktopApp> load_dock_apps(const DockConfig& config,
 
 class MagnificationProfile {
   public:
-    MagnificationProfile() { configure(DEFAULT_MAX_SCALE); }
+    MagnificationProfile() { configure(BASE_WIDTH, DEFAULT_MAX_SCALE, 6.0); }
 
     // The reference's width curve is BASE * {1, 1.1, 1.414, 2} across the
     // half-width of the falloff. Expressed as a fraction of the peak excursion
     // that is {0, 0.1, 0.414, 1}, which generalises to any peak scale and
     // reproduces the reference exactly at 2.0.
-    void configure(double max_scale) {
+    void configure(double base_width, double max_scale, double spread) {
         static const double kShape[4] = {0.0, 0.1, 0.414, 1.0};
-        const double excursion = BASE_WIDTH * (max_scale - 1.0);
+        base_width_ = base_width;
+        const double excursion = base_width * (max_scale - 1.0);
+        // The falloff is measured in icon widths, so it scales with the icon
+        // size rather than staying a fixed number of pixels -- a bigger dock
+        // should magnify over a proportionally bigger span, not a stubbier one.
+        // The spread itself is what decides how much the hovered icon stands
+        // out from its neighbours.
+        const double limit = base_width * spread;
 
         distance_input_ = {
-            -DISTANCE_LIMIT, -DISTANCE_LIMIT / 1.25, -DISTANCE_LIMIT / 2.0, 0.0,
-            DISTANCE_LIMIT / 2.0, DISTANCE_LIMIT / 1.25, DISTANCE_LIMIT,
+            -limit, -limit / 1.25, -limit / 2.0, 0.0, limit / 2.0, limit / 1.25, limit,
         };
         width_output_ = {
-            BASE_WIDTH + kShape[0] * excursion,
-            BASE_WIDTH + kShape[1] * excursion,
-            BASE_WIDTH + kShape[2] * excursion,
-            BASE_WIDTH + kShape[3] * excursion,
-            BASE_WIDTH + kShape[2] * excursion,
-            BASE_WIDTH + kShape[1] * excursion,
-            BASE_WIDTH + kShape[0] * excursion,
+            base_width + kShape[0] * excursion, base_width + kShape[1] * excursion,
+            base_width + kShape[2] * excursion, base_width + kShape[3] * excursion,
+            base_width + kShape[2] * excursion, base_width + kShape[1] * excursion,
+            base_width + kShape[0] * excursion,
         };
     }
 
     double interpolate_width(double distance) const {
         if (distance <= distance_input_.front() || distance >= distance_input_.back()) {
-            return BASE_WIDTH;
+            return base_width_;
         }
 
         for (std::size_t i = 0; i + 1 < distance_input_.size(); ++i) {
@@ -316,10 +341,11 @@ class MagnificationProfile {
             }
         }
 
-        return BASE_WIDTH;
+        return base_width_;
     }
 
   private:
+    double base_width_ = BASE_WIDTH;
     std::vector<double> distance_input_;
     std::vector<double> width_output_;
 };
@@ -389,6 +415,21 @@ class DockEngine {
     // the pin exists because without it the toplevel renegotiates its surface
     // size with the compositor on every magnification frame, which halves the
     // frame rate.
+    // Everything derived from the config in one place, so a reload cannot
+    // update half of it.
+    void apply_config_geometry() {
+        base_width_ = config_.icon_size > 0
+                          ? std::clamp(static_cast<double>(config_.icon_size),
+                                       static_cast<double>(MIN_ICON_SIZE),
+                                       static_cast<double>(MAX_ICON_SIZE))
+                          : BASE_WIDTH;
+        magnifier_.configure(base_width_, std::clamp(config_.max_scale, MIN_MAX_SCALE, MAX_MAX_SCALE),
+                             config_.spread);
+        last_applied_pixel_widths_.clear();
+        last_applied_panel_width_ = -1;
+        last_icon_scale_ = 0;
+    }
+
     void apply_window_size() {
         if (window_ == nullptr || layer_shell_active_) {
             return;
@@ -414,7 +455,7 @@ class DockEngine {
         void build_ui(GtkApplication* app, const DockConfig& config,
                       const std::vector<DesktopApp>& dock_apps) {
         config_ = config;
-        magnifier_.configure(config_.max_scale);
+        apply_config_geometry();
         window_ = gtk_application_window_new(app);
         gtk_window_set_title(GTK_WINDOW(window_), "Lucid Dock C++");
         gtk_window_set_decorated(GTK_WINDOW(window_), FALSE);
@@ -550,11 +591,17 @@ class DockEngine {
     // Everything that depends on the configured peak magnification. The
     // surface has to be tall enough to draw a magnified icon and its bounce,
     // so raising MaxScale grows the window rather than clipping the icons.
-    double max_icon_width() const { return BASE_WIDTH * config_.max_scale; }
+    // Idle icon size comes from the config; everything else is derived from it.
+    double base_width() const { return base_width_; }
+    int base_icon_px() const { return icon_px_for(base_width_); }
+    int panel_bg_height() const { return panel_bg_height_for(base_icon_px()); }
+    double max_icon_width() const { return base_width_ * config_.max_scale; }
     int max_icon_px() const { return static_cast<int>(max_icon_width() + 0.5); }
     int icon_source_size() const { return max_icon_px() + 1; }
     int window_height() const {
-        return PANEL_BG_HEIGHT + (max_icon_px() - BASE_ICON_PX) + BOTTOM_MARGIN + TOP_SLACK;
+        // Constant. See SURFACE_HEIGHT: sizing this to the configuration is
+        // what walked the dock down the screen on every magnification change.
+        return SURFACE_HEIGHT;
     }
 
     // Which item is under this x, in root_fixed_ coordinates. Uses the animated
@@ -622,7 +669,7 @@ class DockEngine {
         // is not part of the dock, so pointing at the big icon would shrink it.
         // The DOM gets this for free -- an overflowing <img> is still a
         // descendant of .dock-el, so mouseleave does not fire over it.
-        double tallest = BASE_ICON_PX;
+        double tallest = base_icon_px();
         for (const auto& icon : icons_) {
             tallest = std::max(tallest, icon.current_width);
         }
@@ -654,6 +701,7 @@ class DockEngine {
         // target; the tick callback does the work at frame rate. Throttling
         // here was what made pointer tracking feel steppy.
         self->current_mouse_x_ = x;
+        self->last_pointer_x_ = x;
         self->hovered_index_ = self->icon_at(x);
         self->layout_dirty_ = true;
         self->ensure_tick();
@@ -714,40 +762,62 @@ class DockEngine {
     // the GSK renderer, so a stepped spring would change feel with the renderer.
     // The closed form is exact at any dt and cannot go unstable at a low one.
     bool step_widths(double dt) {
-        const auto targets = compute_item_widths();
-        if (targets.size() != icons_.size()) {
+        const auto shape = compute_item_widths();
+        if (shape.size() != icons_.size()) {
             return false;
         }
 
-        const double omega = SPRING_OMEGA * config_.tracking_speed;
-        const double sigma = SPRING_ZETA * omega;                         // decay rate
-        const double omega_d = omega * std::sqrt(1.0 - SPRING_ZETA * SPRING_ZETA);
-        const double decay = std::exp(-sigma * dt);
-        const double cos_wd = std::cos(omega_d * dt);
-        const double sin_wd = std::sin(omega_d * dt);
+        // Spring the ENVELOPE, not the widths.
+        //
+        // Springing each icon's width made the dock a low-pass filter on
+        // pointer position: sweep quickly and every icon holds a large target
+        // for only a few frames, so none of them get large and they converge on
+        // looking identical. Tuning the spring to fix that is the wrong knob,
+        // because the same spring is what shapes the shrink -- speeding up the
+        // tracking necessarily speeds up the release, and those are not the
+        // same thing.
+        //
+        // macOS does not filter the shape at all. Icon size is a direct
+        // function of pointer position, so a fast sweep magnifies exactly as
+        // much as a slow one. What animates is entering and leaving the dock.
+        // So the shape is applied instantly and a single 0..1 envelope is
+        // sprung: 1 while the pointer is on the dock, 0 when it is not. The
+        // release animation and the magnification response are now independent,
+        // and the fast-sweep attenuation is not a tuning problem, it is gone.
+        const double target = (last_pointer_x_.has_value() && config_.magnification) ? 1.0 : 0.0;
+
+        const double sigma = SPRING_ZETA * SPRING_OMEGA;
+        const double omega_d = SPRING_OMEGA * std::sqrt(1.0 - SPRING_ZETA * SPRING_ZETA);
+        const double a = envelope_ - target;
         bool moving = false;
 
-        for (std::size_t i = 0; i < icons_.size(); ++i) {
-            auto& icon = icons_[i];
-            icon.target_width = targets[i];
+        if (std::abs(a) <= ENVELOPE_SETTLE || std::abs(envelope_velocity_) > 0.0 ||
+            std::abs(a) > ENVELOPE_SETTLE) {
+            if (std::abs(a) <= ENVELOPE_SETTLE &&
+                std::abs(envelope_velocity_) <= ENVELOPE_SETTLE_VELOCITY) {
+                envelope_ = target;
+                envelope_velocity_ = 0.0;
+                // The pointer position is only kept alive to shape the decay.
+                // Once the decay is done it is nothing but stale state.
+                if (target == 0.0) {
+                    last_pointer_x_.reset();
+                }
+            } else {
+                const double decay = std::exp(-sigma * dt);
+                const double cos_wd = std::cos(omega_d * dt);
+                const double sin_wd = std::sin(omega_d * dt);
+                const double b = (envelope_velocity_ + sigma * a) / omega_d;
 
-            // Displacement from the target, and the velocity that goes with it.
-            const double a = icon.current_width - icon.target_width;
-            const double v0 = icon.width_velocity;
-
-            if (std::abs(a) <= WIDTH_SETTLE_EPSILON &&
-                std::abs(v0) <= WIDTH_SETTLE_VELOCITY) {
-                icon.current_width = icon.target_width;
-                icon.width_velocity = 0.0;
-                continue;
+                envelope_ = target + decay * (a * cos_wd + b * sin_wd);
+                envelope_velocity_ = decay * ((omega_d * b - sigma * a) * cos_wd -
+                                              (omega_d * a + sigma * b) * sin_wd);
+                moving = true;
             }
+        }
 
-            const double b = (v0 + sigma * a) / omega_d;
-            icon.current_width = icon.target_width + decay * (a * cos_wd + b * sin_wd);
-            icon.width_velocity =
-                decay * ((omega_d * b - sigma * a) * cos_wd -
-                         (omega_d * a + sigma * b) * sin_wd);
-            moving = true;
+        for (std::size_t i = 0; i < icons_.size(); ++i) {
+            icons_[i].target_width = shape[i];
+            icons_[i].current_width = base_width_ + envelope_ * (shape[i] - base_width_);
         }
 
         return moving;
@@ -876,8 +946,8 @@ class DockEngine {
     // Targets only. The animated value is integrated separately in step_widths()
     // so that losing the pointer eases back to rest instead of snapping.
     std::vector<double> compute_item_widths() const {
-        std::vector<double> widths(icons_.size(), BASE_WIDTH);
-        if (!current_mouse_x_.has_value() || !config_.magnification) {
+        std::vector<double> widths(icons_.size(), base_width_);
+        if (!last_pointer_x_.has_value()) {
             return widths;
         }
 
@@ -886,7 +956,7 @@ class DockEngine {
         // let the dock magnify for a cursor that was nowhere near it. Whether
         // the pointer counts at all is now pointer_is_on_panel()'s decision,
         // and it stops at the panel edge.
-        const double pointer_x = *current_mouse_x_ - panel_x_;
+        const double pointer_x = *last_pointer_x_ - panel_x_;
 
         for (int pass = 0; pass < 2; ++pass) {
             double cursor = PANEL_PADDING_X;
@@ -954,7 +1024,7 @@ class DockEngine {
             if (panel_width != last_applied_panel_width_) {
                 last_applied_panel_width_ = panel_width;
                 gtk_widget_set_size_request(panel_fixed_, panel_width, panel_height);
-                gtk_widget_set_size_request(panel_bg_, panel_width, PANEL_BG_HEIGHT);
+                gtk_widget_set_size_request(panel_bg_, panel_width, panel_bg_height());
             }
 
             // Centre against the width we actually have. The old code took
@@ -982,8 +1052,8 @@ class DockEngine {
             // relative to the icon baseline inside it, so magnified icons grow
             // up and out of the panel instead of the panel growing to contain
             // them.
-            panel_bg_y_ = win_h - PANEL_BG_HEIGHT - BOTTOM_MARGIN;
-            icon_baseline_y_ = panel_bg_y_ + PANEL_PADDING_Y + BASE_ICON_PX;
+            panel_bg_y_ = win_h - panel_bg_height() - BOTTOM_MARGIN;
+            icon_baseline_y_ = panel_bg_y_ + PANEL_PADDING_Y + base_icon_px();
             panel_y_ = icon_baseline_y_ -
                        (PANEL_PADDING_Y + ITEM_SLOT_HEIGHT - ICON_BOTTOM_INSET);
 
@@ -998,24 +1068,24 @@ class DockEngine {
                 g_print("--- lucid-dock geometry ---\n");
                 g_print("window            : %d x %d\n", win_w, win_h);
                 g_print("panel (drawn)     : y %d .. %d   height %d\n",
-                        panel_bg_y_, panel_bg_y_ + PANEL_BG_HEIGHT, PANEL_BG_HEIGHT);
+                        panel_bg_y_, panel_bg_y_ + panel_bg_height(), panel_bg_height());
                 g_print("icon baseline     : y %d\n", icon_baseline_y_);
                 g_print("idle icon top     : y %d  (inside the panel)\n",
-                        icon_baseline_y_ - BASE_ICON_PX);
+                        icon_baseline_y_ - base_icon_px());
                 g_print("magnified top     : y %d  (%d px above the panel, scale %.2f)\n",
                         icon_baseline_y_ - max_icon_px(),
                         panel_bg_y_ - (icon_baseline_y_ - max_icon_px()),
                         config_.max_scale);
                 g_print("item row (no draw): y %d .. %d\n",
                         panel_y_, panel_y_ + panel_height);
-                g_print("screen-edge gap   : %d px\n", win_h - (panel_bg_y_ + PANEL_BG_HEIGHT));
+                g_print("screen-edge gap   : %d px\n", win_h - (panel_bg_y_ + panel_bg_height()));
             }
 
             // Separators span the drawn panel's interior, not the item slot:
             // the slot is tall enough for a magnified icon, and a separator
             // that tall would stick out of the panel along with the icons.
             const int divider_y = (panel_bg_y_ - panel_y_) + PANEL_PADDING_Y;
-            const int divider_height = PANEL_BG_HEIGHT - PANEL_PADDING_Y * 2;
+            const int divider_height = panel_bg_height() - PANEL_PADDING_Y * 2;
 
             // A twentieth of a pixel is under the threshold of anything the
             // compositor can draw differently, and skipping those saves a
@@ -1053,6 +1123,49 @@ class DockEngine {
         }
 
         update_tooltip(gtk_widget_get_width(window_));
+        update_input_region();
+    }
+
+    // Restrict the pointer region to the pixels the dock actually occupies.
+    //
+    // A layer surface takes pointer input across its whole area by default, and
+    // this one is monitor-wide and SURFACE_HEIGHT tall -- so without this the
+    // dock silently swallows every click in a band across the bottom of the
+    // screen, including on the windows behind it. That was already true before
+    // the surface grew; the constant height just makes it unmissable.
+    //
+    // The region is the same rectangle pointer_is_on_panel() accepts, so what
+    // the compositor delivers and what the dock considers "on the dock" cannot
+    // disagree.
+    void update_input_region() {
+        GtkNative* native = window_ != nullptr ? gtk_widget_get_native(window_) : nullptr;
+        GdkSurface* surface = native != nullptr ? gtk_native_get_surface(native) : nullptr;
+        if (surface == nullptr || panel_content_width_ <= 0) {
+            return;
+        }
+
+        double tallest = base_icon_px();
+        for (const auto& icon : icons_) {
+            tallest = std::max(tallest, icon.current_width);
+        }
+
+        const int x = static_cast<int>(std::floor(panel_x_));
+        const int width =
+            static_cast<int>(std::ceil(panel_content_width_ + 2.0 * PANEL_PADDING_X)) + 1;
+        const int top = static_cast<int>(
+            std::floor(icon_baseline_y_ - tallest - PANEL_PADDING_Y));
+        const int height = std::max(gtk_widget_get_height(window_), SURFACE_HEIGHT) - top;
+
+        const cairo_rectangle_int_t rect{x, std::max(0, top), width, std::max(1, height)};
+        if (rect.x == last_input_region_.x && rect.y == last_input_region_.y &&
+            rect.width == last_input_region_.width && rect.height == last_input_region_.height) {
+            return;
+        }
+        last_input_region_ = rect;
+
+        cairo_region_t* region = cairo_region_create_rectangle(&rect);
+        gdk_surface_set_input_region(surface, region);
+        cairo_region_destroy(region);
     }
 
     void update_icon_internal_layout(IconRuntime& icon) {
@@ -1195,9 +1308,11 @@ class DockEngine {
                 }
             }
 
+            icon.current_width = base_width_;
+            icon.target_width = base_width_;
             icon.image = gtk_image_new();
             apply_icon_paintable(icon);
-            gtk_image_set_pixel_size(GTK_IMAGE(icon.image), static_cast<int>(std::round(BASE_WIDTH)));
+            gtk_image_set_pixel_size(GTK_IMAGE(icon.image), base_icon_px());
             gtk_fixed_put(GTK_FIXED(icon.fixed), icon.image, 0.0, 0.0);
 
             icon.dot = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
@@ -1432,7 +1547,7 @@ class DockEngine {
                                       g_variant_new_boolean(config_.magnification ? TRUE : FALSE));
         }
 
-        magnifier_.configure(config_.max_scale);
+        apply_config_geometry();
         geom_logged_ = false;   // geometry may have moved; let it print again
         apply_window_size();
 
@@ -1547,12 +1662,19 @@ window {
     std::vector<IconRuntime> icons_;
     MagnificationProfile magnifier_;
     DockConfig config_;
+    double base_width_ = BASE_WIDTH;
     GtkWidget* menu_ = nullptr;
     GSimpleActionGroup* actions_ = nullptr;
     GFileMonitor* config_monitor_ = nullptr;
     std::vector<int> last_applied_pixel_widths_;
 
     std::optional<double> current_mouse_x_;
+    // Where the pointer was when it left. Kept until the envelope has finished
+    // decaying, so the dock shrinks from the shape it had rather than snapping
+    // flat and then easing nothing.
+    std::optional<double> last_pointer_x_;
+    double envelope_ = 0.0;
+    double envelope_velocity_ = 0.0;
 
     guint tick_id_ = 0;
     guint running_refresh_id_ = 0;
@@ -1575,6 +1697,7 @@ window {
     int icon_baseline_y_ = 0;
     double panel_content_width_ = 0.0;
     int last_applied_panel_width_ = -1;
+    cairo_rectangle_int_t last_input_region_{-1, -1, -1, -1};
 };
 
 void on_activate(GtkApplication* app, gpointer) {

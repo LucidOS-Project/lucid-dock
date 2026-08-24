@@ -149,11 +149,11 @@ struct DockConfig {
     bool magnification = true;
     // Peak magnification, as a multiple of the icon size. The reference uses 2.
     double max_scale = 2.0;
-    // Multiplier on the width spring's natural frequency. Above 1 the icons
-    // track the pointer more tightly; this is the knob for "when I sweep fast
-    // they all end up the same size", which is the spring lagging a target that
-    // is moving faster than it settles, not a shortage of magnification.
-    double tracking_speed = 1.0;
+    // How far the magnification reaches, in icon widths either side of the
+    // pointer. This is what decides how much the icon under the pointer stands
+    // out from its neighbours: a small spread lifts almost only the hovered
+    // icon, a large one raises a broad gentle hill. The reference uses 6.
+    double spread = 6.0;
 
     // Parsed, round-tripped and written into a fresh config file so the keys
     // are discoverable, but not acted on yet. A settings UI needs somewhere to
@@ -210,7 +210,7 @@ inline bool read_config(DockConfig& config) {
 
     for (const auto& [key, target, lo, hi] : {
              std::tuple<const char*, double*, double, double>{"MaxScale", &config.max_scale, 1.0, 3.0},
-             std::tuple<const char*, double*, double, double>{"TrackingSpeed", &config.tracking_speed, 0.25, 4.0}}) {
+             std::tuple<const char*, double*, double, double>{"Spread", &config.spread, 1.5, 8.0}}) {
         const double value = g_key_file_get_double(keyfile, kConfigGroup, key, &error);
         if (error == nullptr) {
             *target = std::clamp(value, lo, hi);
@@ -261,7 +261,7 @@ inline bool write_config(const DockConfig& config) {
     set_key_string_list(keyfile, "DividersBefore", config.dividers_before);
     g_key_file_set_boolean(keyfile, kConfigGroup, "Magnification", config.magnification ? TRUE : FALSE);
     g_key_file_set_double(keyfile, kConfigGroup, "MaxScale", config.max_scale);
-    g_key_file_set_double(keyfile, kConfigGroup, "TrackingSpeed", config.tracking_speed);
+    g_key_file_set_double(keyfile, kConfigGroup, "Spread", config.spread);
     g_key_file_set_integer(keyfile, kConfigGroup, "IconSize", config.icon_size);
     g_key_file_set_string(keyfile, kConfigGroup, "LayoutMode", config.layout_mode.c_str());
     g_key_file_set_string(keyfile, kConfigGroup, "Position", config.position.c_str());
@@ -272,11 +272,11 @@ inline bool write_config(const DockConfig& config) {
         " Draw a separator immediately before each of these.", nullptr);
     g_key_file_set_comment(keyfile, kConfigGroup, "MaxScale",
         " Peak magnification, 1.0 to 3.0. The reference dock uses 2.0.", nullptr);
-    g_key_file_set_comment(keyfile, kConfigGroup, "TrackingSpeed",
-        " How tightly icons follow the pointer, 0.25 to 4.0. Raise this if a\n"
-        " fast sweep leaves every icon looking the same size.", nullptr);
+    g_key_file_set_comment(keyfile, kConfigGroup, "Spread",
+        " How far magnification reaches, in icon widths, 1.5 to 8.0. Lower\n"
+        " makes the icon under the pointer stand out more from its neighbours.", nullptr);
     g_key_file_set_comment(keyfile, kConfigGroup, "IconSize",
-        " 0 means the built-in default. NOT YET HONOURED -- reserved.", nullptr);
+        " Idle icon size in pixels, 24 to 80. 0 means the default of 58.", nullptr);
     g_key_file_set_comment(keyfile, kConfigGroup, "LayoutMode",
         " dock | taskbar. NOT YET HONOURED -- reserved.", nullptr);
     g_key_file_set_comment(keyfile, kConfigGroup, "Position",

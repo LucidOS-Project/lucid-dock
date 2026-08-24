@@ -354,11 +354,24 @@ GtkWidget* lucid_dock_settings_page_new(void) {
     gtk_widget_set_margin_end(column, 12);
     page->root = column;
 
-    gtk_box_append(GTK_BOX(column), section_heading("Magnification"));
+    gtk_box_append(GTK_BOX(column), section_heading("Appearance"));
 
     GtkWidget* frame = gtk_frame_new(nullptr);
     GtkWidget* behaviour = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_frame_set_child(GTK_FRAME(frame), behaviour);
+
+    // Idle icon size. 0 in the file means "the default", which is not a value a
+    // slider can express, so it is resolved to the default here and written out
+    // as a real number the moment the user touches it.
+    gtk_box_append(
+        GTK_BOX(behaviour),
+        labelled_row("Size", "How large the icons are when nothing is hovered.",
+                     build_scale(page, 24.0, 80.0, 1.0,
+                                 page->config.icon_size > 0 ? page->config.icon_size : 58,
+                                 [](SettingsPage* p, double v) {
+                                     p->config.icon_size = static_cast<int>(v + 0.5);
+                                 })));
+    gtk_box_append(GTK_BOX(behaviour), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL));
 
     GtkWidget* magnify = gtk_switch_new();
     gtk_switch_set_active(GTK_SWITCH(magnify), page->config.magnification ? TRUE : FALSE);
@@ -384,11 +397,11 @@ GtkWidget* lucid_dock_settings_page_new(void) {
     gtk_box_append(GTK_BOX(behaviour), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL));
     gtk_box_append(
         GTK_BOX(behaviour),
-        labelled_row("Tracking speed",
-                     "How closely icons follow the pointer. Raise this if a fast sweep "
-                     "leaves every icon looking the same size.",
-                     build_scale(page, 0.25, 4.0, 0.05, page->config.tracking_speed,
-                                 [](SettingsPage* p, double v) { p->config.tracking_speed = v; })));
+        labelled_row("Spread",
+                     "How far magnification reaches, in icon widths. Lower makes the icon "
+                     "under the pointer stand out more from its neighbours.",
+                     build_scale(page, 1.5, 8.0, 0.1, page->config.spread,
+                                 [](SettingsPage* p, double v) { p->config.spread = v; })));
     gtk_box_append(GTK_BOX(column), frame);
 
     gtk_box_append(GTK_BOX(column), section_heading("Applications"));

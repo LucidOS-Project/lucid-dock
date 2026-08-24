@@ -119,8 +119,9 @@ application has one directory to look in.
 | `DividersBefore` | Draw a separator before each of these |
 | `Magnification` | On/off |
 | `MaxScale` | Peak magnification, 1.0–3.0 (reference: 2.0) |
-| `TrackingSpeed` | How tightly icons follow the pointer, 0.25–4.0 |
-| `IconSize`, `LayoutMode`, `Position` | Written and round-tripped, **not yet honoured** |
+| `Spread` | How far magnification reaches in icon widths, 1.5–8.0 |
+| `IconSize` | Idle icon size in px, 24–80 (0 = the default 58) |
+| `LayoutMode`, `Position` | Written and round-tripped, **not yet honoured** |
 
 **The file is the only source of truth.** The right-click menu does not hold
 settings in memory and hand them out — it writes the file, and the file is what
@@ -228,6 +229,39 @@ It needs headroom, so the surface is now 198 px rather than 160 at `MaxScale`
 and a layer surface takes pointer input across its whole area unless an input
 region is set, which GTK does not expose. Worth fixing before this ships.
 
+### The surface is a constant size
+
+`SURFACE_HEIGHT` is a compile-time constant sized for the largest configuration
+the dock will accept, not for the current one.
+
+Sizing it to the current configuration made the dock walk down the screen every
+time magnification was raised. Growing a surface is only free under layer-shell,
+where it is anchored to the bottom edge and grows upward; on the fallback path
+the compositor owns placement, keeps the window's top where it is, and the extra
+height comes out of the bottom. Each increase pushed the dock further down, and
+only restarting put it back.
+
+A constant surface cannot do that on either path. Verified across `MaxScale`
+2 -> 3 and `IconSize` 58 -> 80: window stays 1440x323, the panel's bottom edge
+stays at the same y, and the panel grows *upward* (79 px to 101 px) as it should.
+
+Configuration is clamped to what that constant can contain: icon size 24-80,
+magnification 1.0-3.0.
+
+### Input region
+
+A layer surface takes pointer input across its whole area by default, and this
+one is monitor-wide. Without an input region the dock silently swallows every
+click in a band across the bottom of the screen, including on the windows behind
+it. That was true at 160 px too; a constant 323 px surface just makes it
+impossible to ignore.
+
+`gdk_surface_set_input_region()` restricts it to the rectangle the dock actually
+occupies -- the same rectangle `pointer_is_on_panel()` accepts, so what the
+compositor delivers and what the dock counts as "on the dock" cannot disagree.
+It follows the icons as they magnify, and is only pushed to the compositor when
+it actually changes.
+
 ## Right-click menu
 
 Right-click anywhere on the dock: Magnification, Edit Configuration File…,
@@ -282,27 +316,38 @@ Release, 2x back to 1x:
 | `RELEASE_TAU = 135 ms` (removed) | 94 ms | 311 ms | 622 ms |
 | `MAGNIFY_TAU = 55 ms` (removed) | 38 ms | 127 ms | 253 ms |
 
-### Magnification collapses during a fast sweep
+### The shape is not animated; entering and leaving is
 
-Sweeping the pointer quickly does not make the dock feel delayed — nothing
-arrives late. It makes the icons *smaller*, because each one only holds a large
-target for a few frames before the pointer has moved on, and the spring
-integrates just part of that excursion. It is amplitude attenuation, not lag:
+Springing each icon's width made the dock a low-pass filter on pointer position.
+Sweep quickly and every icon holds a large target for only a few frames, so none
+of them get large and they converge on looking the same size:
 
-| Sweep speed | Peak reached | of full | Spread above base |
-|---|---|---|---|
-| slow drag | 112.3 px | 98% | 54.7 px |
-| normal move | 105.9 px | 92% | 48.3 px |
-| quick move | 96.3 px | 84% | 38.7 px |
-| fast flick | 83.2 px | 72% | 25.6 px |
-| very fast flick | 71.3 px | 62% | 13.7 px |
+| Sweep speed | Peak reached, per-icon spring | Envelope model |
+|---|---|---|
+| slow drag | 112.3 px (98%) | 115.2 px (100%) |
+| normal move | 105.9 px (92%) | 115.2 px (100%) |
+| fast flick | 83.2 px (72%) | 115.2 px (100%) |
+| very fast flick | 71.3 px (62%) | 115.2 px (100%) |
 
-The last column is what you actually see: the spread between neighbouring icons
-falls from 55 px to 14 px, so they converge on looking identical.
+The first attempt at this exposed a `TrackingSpeed` knob to tighten the spring.
+That was the wrong fix and it was wrong in an instructive way: **it was the same
+spring that shapes the shrink**, so tightening the tracking necessarily sped up
+the release. Two unrelated things behind one control.
 
-`TrackingSpeed` is the knob for it, not `MaxScale`. At a fast flick,
-`TrackingSpeed 2.0` recovers the same 38 px of spread that `MaxScale 3.0` does,
-without making the dock permanently larger when you are moving slowly.
+macOS does not filter the shape at all. Icon size is a direct function of
+pointer position, so a fast sweep magnifies exactly as much as a slow one; what
+animates is *entering and leaving the dock*. So the shape is applied instantly
+and a single 0..1 envelope is sprung -- 1 while the pointer is on the dock, 0
+when it is not -- with each width being `base + envelope * (shape - base)`.
+
+Release animation and magnification response are now independent, the
+attenuation is gone rather than tuned, and there is no knob for it because there
+is no longer anything to tune. `layout_panel()` also dropped from 0.088 ms to
+0.033 ms, since eleven springs became one.
+
+The pointer position is remembered after the pointer leaves, until the envelope
+finishes decaying -- otherwise the shape would snap flat and the envelope would
+be easing nothing.
 
 `omega_n` is set ~23% above the reference deliberately: same spring shape, run
 a little quicker, because the reference tracks a touch lazily for a dock driven
