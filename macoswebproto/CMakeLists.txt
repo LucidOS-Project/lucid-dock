@@ -46,3 +46,8 @@ else()
 endif()
 
 target_link_libraries(lucid_dock_cpp PRIVATE PkgConfig::GTK4 PkgConfig::GIO_UNIX)
+
+# The settings UI. Separate binary, shares dock_config.h, and deliberately does
+# not link layer-shell: it is an ordinary application window.
+add_executable(lucid_dock_settings dock_settings_page.cpp lucid_dock_settings.cpp)
+target_link_libraries(lucid_dock_settings PRIVATE PkgConfig::GTK4 PkgConfig::GIO_UNIX)

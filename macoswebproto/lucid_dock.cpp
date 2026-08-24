@@ -9,6 +9,8 @@
 
 #include <gio/gdesktopappinfo.h>
 
+#include "dock_config.h"
+
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -25,6 +27,8 @@
 #include <vector>
 
 namespace {
+
+using namespace lucid;
 
 constexpr double BASE_WIDTH = 57.6;
 constexpr double DEFAULT_MAX_SCALE = 2.0;
@@ -66,10 +70,17 @@ constexpr int DIVIDER_SLOT = DIVIDER_WIDTH + DIVIDER_MARGIN * 2;
 constexpr int PANEL_BG_HEIGHT = BASE_ICON_PX + DOT_SIZE + 1 + PANEL_PADDING_Y * 2;
 
 
-// Vertical headroom above a fully magnified icon. The launch bounce lifts an
-// icon by BOUNCE_HEIGHT, and without room for it the bounce clips against the
-// top of the surface instead of being drawn.
-constexpr int TOP_SLACK = 16;
+// The name label above the hovered icon. The reference has no transition on it
+// at all -- display: none to display: block -- so it appears on the same frame
+// the pointer arrives. GTK's stock tooltip cannot do that: it waits ~500 ms by
+// design, which reads as a different interaction entirely.
+constexpr int TOOLTIP_GAP = 10;         // icon top to label bottom
+constexpr int TOOLTIP_RESERVE = 36;     // headroom to reserve for it
+
+// Vertical headroom above a fully magnified icon: enough for the name label,
+// and for the launch bounce, which lifts an icon by BOUNCE_HEIGHT and clips
+// against the top of the surface without room to move into.
+constexpr int TOP_SLACK = TOOLTIP_RESERVE + TOOLTIP_GAP + 8;
 
 // Magnification easing is a damped spring, not exponential decay, and it is the
 // same spring in both directions. Exponential decay was the wrong model: it is
@@ -99,13 +110,6 @@ constexpr double WIDTH_SETTLE_VELOCITY = 2.0;   // px/s
 
 constexpr double BOUNCE_HEIGHT = 40.0;
 constexpr double BOUNCE_DURATION = 0.4;
-
-struct DesktopCatalogEntry {
-    std::filesystem::path desktop_path;
-    std::string title;
-    std::string icon_name;
-    std::string exec_line;
-};
 
 struct DesktopApp {
     std::string app_id;
@@ -161,318 +165,9 @@ std::string to_lower_copy(std::string text) {
     return text;
 }
 
-std::optional<std::string> load_keyfile_value(GKeyFile* key_file, const char* key) {
-    GError* error = nullptr;
-    gchar* value = g_key_file_get_string(key_file, "Desktop Entry", key, &error);
-    if (error != nullptr) {
-        g_error_free(error);
-        return std::nullopt;
-    }
-    std::string result = value != nullptr ? value : "";
-    g_free(value);
-    return result;
-}
 
-bool load_desktop_info(const std::filesystem::path& desktop_path, DesktopCatalogEntry& entry) {
-    GKeyFile* key_file = g_key_file_new();
-    GError* error = nullptr;
-    if (!g_key_file_load_from_file(key_file, desktop_path.c_str(), G_KEY_FILE_NONE, &error)) {
-        if (error != nullptr) {
-            g_error_free(error);
-        }
-        g_key_file_unref(key_file);
-        return false;
-    }
 
-    GError* type_error = nullptr;
-    gchar* type_value = g_key_file_get_string(key_file, "Desktop Entry", "Type", &type_error);
-    const bool is_application = type_value != nullptr && std::string(type_value) == "Application";
-    g_free(type_value);
-    if (type_error != nullptr) {
-        g_error_free(type_error);
-    }
-    if (!is_application) {
-        g_key_file_unref(key_file);
-        return false;
-    }
 
-    GError* hidden_error = nullptr;
-    const gboolean nodisplay = g_key_file_get_boolean(key_file, "Desktop Entry", "NoDisplay", &hidden_error);
-    if (hidden_error != nullptr) {
-        g_error_free(hidden_error);
-    }
-    if (nodisplay) {
-        g_key_file_unref(key_file);
-        return false;
-    }
-
-    const auto title = load_keyfile_value(key_file, "Name");
-    const auto icon_name = load_keyfile_value(key_file, "Icon");
-    const auto exec_line = load_keyfile_value(key_file, "Exec");
-
-    entry.desktop_path = desktop_path;
-    entry.title = title.value_or(desktop_path.stem().string());
-    entry.icon_name = icon_name.value_or("");
-    entry.exec_line = exec_line.value_or("");
-
-    g_key_file_unref(key_file);
-    return true;
-}
-
-void scan_desktop_directory(const std::filesystem::path& directory, std::map<std::string, DesktopCatalogEntry>& catalog) {
-    std::error_code ec;
-    if (!std::filesystem::exists(directory, ec)) {
-        return;
-    }
-
-    for (const auto& entry : std::filesystem::directory_iterator(directory, ec)) {
-        if (ec) {
-            break;
-        }
-        if (!entry.is_regular_file(ec) || entry.path().extension() != ".desktop") {
-            continue;
-        }
-
-        DesktopCatalogEntry desktop_entry;
-        if (!load_desktop_info(entry.path(), desktop_entry)) {
-            continue;
-        }
-
-        catalog[entry.path().filename().string()] = std::move(desktop_entry);
-    }
-}
-
-std::map<std::string, DesktopCatalogEntry> load_desktop_catalog() {
-    std::map<std::string, DesktopCatalogEntry> catalog;
-
-    const char* user_data_dir = g_get_user_data_dir();
-    if (user_data_dir != nullptr) {
-        scan_desktop_directory(std::filesystem::path(user_data_dir) / "applications", catalog);
-    }
-
-    const char* const* system_data_dirs = g_get_system_data_dirs();
-    if (system_data_dirs != nullptr) {
-        for (const char* const* it = system_data_dirs; *it != nullptr; ++it) {
-            scan_desktop_directory(std::filesystem::path(*it) / "applications", catalog);
-        }
-    }
-
-    scan_desktop_directory(std::filesystem::path("/usr/share/applications"), catalog);
-    return catalog;
-}
-
-// ---------------------------------------------------------------------------
-// Configuration
-//
-// GKeyFile rather than TOML or JSON: it needs no dependency GLib does not
-// already provide, and it is the syntax .desktop files are already written in,
-// so it is the one config format a Linux desktop component can assume is
-// already understood. ~/.config/lucid/ is shared with the other LucidOS
-// components so a settings app has a single directory to look in.
-// ---------------------------------------------------------------------------
-
-constexpr const char* kConfigGroup = "Dock";
-
-struct DockConfig {
-    std::vector<std::string> pinned;
-    std::vector<std::string> dividers_before;
-    bool magnification = true;
-    // Peak magnification, as a multiple of the icon size. The reference uses 2.
-    double max_scale = 2.0;
-    // Multiplier on the width spring's natural frequency. Above 1 the icons
-    // track the pointer more tightly; this is the knob for "when I sweep fast
-    // they all end up the same size", which is the spring lagging a target that
-    // is moving faster than it settles, not a shortage of magnification.
-    double tracking_speed = 1.0;
-
-    // Parsed, round-tripped and written into a fresh config file so the keys
-    // are discoverable, but not acted on yet. A settings UI needs somewhere to
-    // put these before the dock can honour them.
-    std::string layout_mode = "dock";   // dock | taskbar
-    std::string position = "bottom";    // bottom | left | right | top
-    int icon_size = 0;                  // 0 = the built-in 57.6 px
-};
-
-std::filesystem::path config_dir() {
-    const char* base = g_get_user_config_dir();
-    return std::filesystem::path(base != nullptr ? base : "") / "lucid";
-}
-
-std::filesystem::path config_file_path() {
-    return config_dir() / "dock.conf";
-}
-
-std::vector<std::string> key_string_list(GKeyFile* keyfile, const char* key) {
-    std::vector<std::string> out;
-    gsize count = 0;
-    gchar** values = g_key_file_get_string_list(keyfile, kConfigGroup, key, &count, nullptr);
-    if (values != nullptr) {
-        for (gsize i = 0; i < count; ++i) {
-            if (values[i] != nullptr && *values[i] != '\0') {
-                out.emplace_back(values[i]);
-            }
-        }
-        g_strfreev(values);
-    }
-    return out;
-}
-
-bool read_config(DockConfig& config) {
-    GKeyFile* keyfile = g_key_file_new();
-    const std::string path = config_file_path().string();
-
-    if (!g_key_file_load_from_file(keyfile, path.c_str(), G_KEY_FILE_KEEP_COMMENTS, nullptr)) {
-        g_key_file_free(keyfile);
-        return false;
-    }
-
-    config.pinned = key_string_list(keyfile, "Pinned");
-    config.dividers_before = key_string_list(keyfile, "DividersBefore");
-
-    GError* error = nullptr;
-    const gboolean magnification =
-        g_key_file_get_boolean(keyfile, kConfigGroup, "Magnification", &error);
-    if (error == nullptr) {
-        config.magnification = magnification != FALSE;
-    } else {
-        g_clear_error(&error);
-    }
-
-    for (const auto& [key, target, lo, hi] : {
-             std::tuple<const char*, double*, double, double>{"MaxScale", &config.max_scale, 1.0, 3.0},
-             std::tuple<const char*, double*, double, double>{"TrackingSpeed", &config.tracking_speed, 0.25, 4.0}}) {
-        const double value = g_key_file_get_double(keyfile, kConfigGroup, key, &error);
-        if (error == nullptr) {
-            *target = std::clamp(value, lo, hi);
-        } else {
-            g_clear_error(&error);
-        }
-    }
-
-    const int icon_size = g_key_file_get_integer(keyfile, kConfigGroup, "IconSize", &error);
-    if (error == nullptr) {
-        config.icon_size = icon_size;
-    } else {
-        g_clear_error(&error);
-    }
-
-    for (const auto& [key, target] : {std::pair<const char*, std::string*>{"LayoutMode", &config.layout_mode},
-                                      std::pair<const char*, std::string*>{"Position", &config.position}}) {
-        gchar* value = g_key_file_get_string(keyfile, kConfigGroup, key, nullptr);
-        if (value != nullptr) {
-            *target = value;
-            g_free(value);
-        }
-    }
-
-    g_key_file_free(keyfile);
-    return true;
-}
-
-void set_key_string_list(GKeyFile* keyfile, const char* key, const std::vector<std::string>& values) {
-    std::vector<const gchar*> raw;
-    raw.reserve(values.size());
-    for (const auto& value : values) {
-        raw.push_back(value.c_str());
-    }
-    g_key_file_set_string_list(keyfile, kConfigGroup, key, raw.data(), raw.size());
-}
-
-bool write_config(const DockConfig& config) {
-    std::error_code ec;
-    std::filesystem::create_directories(config_dir(), ec);
-    if (ec) {
-        g_warning("Could not create %s: %s", config_dir().c_str(), ec.message().c_str());
-        return false;
-    }
-
-    GKeyFile* keyfile = g_key_file_new();
-    set_key_string_list(keyfile, "Pinned", config.pinned);
-    set_key_string_list(keyfile, "DividersBefore", config.dividers_before);
-    g_key_file_set_boolean(keyfile, kConfigGroup, "Magnification", config.magnification ? TRUE : FALSE);
-    g_key_file_set_double(keyfile, kConfigGroup, "MaxScale", config.max_scale);
-    g_key_file_set_double(keyfile, kConfigGroup, "TrackingSpeed", config.tracking_speed);
-    g_key_file_set_integer(keyfile, kConfigGroup, "IconSize", config.icon_size);
-    g_key_file_set_string(keyfile, kConfigGroup, "LayoutMode", config.layout_mode.c_str());
-    g_key_file_set_string(keyfile, kConfigGroup, "Position", config.position.c_str());
-
-    g_key_file_set_comment(keyfile, kConfigGroup, "Pinned",
-        " Desktop file IDs, in the order they appear on the dock.", nullptr);
-    g_key_file_set_comment(keyfile, kConfigGroup, "DividersBefore",
-        " Draw a separator immediately before each of these.", nullptr);
-    g_key_file_set_comment(keyfile, kConfigGroup, "MaxScale",
-        " Peak magnification, 1.0 to 3.0. The reference dock uses 2.0.", nullptr);
-    g_key_file_set_comment(keyfile, kConfigGroup, "TrackingSpeed",
-        " How tightly icons follow the pointer, 0.25 to 4.0. Raise this if a\n"
-        " fast sweep leaves every icon looking the same size.", nullptr);
-    g_key_file_set_comment(keyfile, kConfigGroup, "IconSize",
-        " 0 means the built-in default. NOT YET HONOURED -- reserved.", nullptr);
-    g_key_file_set_comment(keyfile, kConfigGroup, "LayoutMode",
-        " dock | taskbar. NOT YET HONOURED -- reserved.", nullptr);
-    g_key_file_set_comment(keyfile, kConfigGroup, "Position",
-        " bottom | left | right | top. NOT YET HONOURED -- reserved.", nullptr);
-    g_key_file_set_comment(keyfile, nullptr, nullptr,
-        " lucid-dock configuration. Edited live: saving this file re-reads it.", nullptr);
-
-    GError* error = nullptr;
-    const std::string path = config_file_path().string();
-    const gboolean ok = g_key_file_save_to_file(keyfile, path.c_str(), &error);
-    if (!ok && error != nullptr) {
-        g_warning("Could not write %s: %s", path.c_str(), error->message);
-        g_error_free(error);
-    }
-
-    g_key_file_free(keyfile);
-    return ok != FALSE;
-}
-
-// Is a GSettings schema actually installed? g_settings_new() on a missing
-// schema is a g_error(), which aborts the process -- so this is not a style
-// preference, it is the difference between running and not. The dock used to
-// call g_settings_new("org.gnome.shell") unguarded, which meant it died on
-// launch on KDE, sway, Hyprland and COSMIC: every compositor where layer-shell
-// actually works.
-bool gsettings_schema_installed(const char* schema_id) {
-    GSettingsSchemaSource* source = g_settings_schema_source_get_default();
-    if (source == nullptr) {
-        return false;
-    }
-
-    GSettingsSchema* schema = g_settings_schema_source_lookup(source, schema_id, TRUE);
-    if (schema == nullptr) {
-        return false;
-    }
-
-    g_settings_schema_unref(schema);
-    return true;
-}
-
-std::vector<std::string> get_gnome_favorite_desktop_ids() {
-    std::vector<std::string> favorites;
-
-    if (!gsettings_schema_installed("org.gnome.shell")) {
-        return favorites;
-    }
-
-    GSettings* settings = g_settings_new("org.gnome.shell");
-    if (settings == nullptr) {
-        return favorites;
-    }
-
-    gchar** values = g_settings_get_strv(settings, "favorite-apps");
-    if (values != nullptr) {
-        for (gchar** it = values; *it != nullptr; ++it) {
-            std::string desktop_id = *it;
-            if (desktop_id.size() >= 8 && desktop_id.rfind(".desktop") == desktop_id.size() - 8) {
-                favorites.push_back(std::move(desktop_id));
-            }
-        }
-        g_strfreev(values);
-    }
-
-    g_object_unref(settings);
-    return favorites;
-}
 
 std::vector<std::string> exec_candidates(const std::string& exec_line, const std::string& desktop_id) {
     std::vector<std::string> candidates;
@@ -533,68 +228,6 @@ std::filesystem::path find_icon_in_lucid_theme(const std::string& icon_name) {
 // What to pin when there is no config file and no GNOME to borrow from. One
 // entry per role, first match wins, anything not installed is skipped -- so
 // this produces a short, sane dock on KDE or sway rather than an empty one.
-std::vector<std::string> builtin_default_pinned(
-    const std::map<std::string, DesktopCatalogEntry>& catalog) {
-    static const std::vector<std::vector<std::string>> kRoles = {
-        {"org.gnome.Nautilus.desktop", "nautilus.desktop", "org.kde.dolphin.desktop",
-         "thunar.desktop", "nemo.desktop", "pcmanfm.desktop"},
-        {"firefox.desktop", "firefox_firefox.desktop", "org.mozilla.firefox.desktop",
-         "chromium.desktop", "chromium-browser.desktop", "google-chrome.desktop"},
-        {"org.gnome.Terminal.desktop", "org.gnome.Console.desktop", "org.kde.konsole.desktop",
-         "alacritty.desktop", "kitty.desktop", "xterm.desktop"},
-        {"org.gnome.TextEditor.desktop", "gedit.desktop", "org.kde.kate.desktop",
-         "code.desktop"},
-        {"org.gnome.Software.desktop", "org.kde.discover.desktop", "snap-store.desktop"},
-        {"org.gnome.Settings.desktop", "gnome-control-center.desktop", "systemsettings.desktop"},
-    };
-
-    std::vector<std::string> pinned;
-    for (const auto& role : kRoles) {
-        for (const auto& candidate : role) {
-            if (catalog.find(candidate) != catalog.end()) {
-                pinned.push_back(candidate);
-                break;
-            }
-        }
-    }
-    return pinned;
-}
-
-// Read the config, creating it on first run. Seeded from GNOME's favourites
-// when that schema exists -- so the dock keeps looking the way it did on a
-// GNOME box -- and from builtin_default_pinned() when it does not. Either way
-// the result is written to disk, so from the second run on there is exactly
-// one source of truth and GNOME is no longer consulted at all.
-DockConfig ensure_config(const std::map<std::string, DesktopCatalogEntry>& catalog) {
-    DockConfig config;
-    if (read_config(config)) {
-        return config;
-    }
-
-    config.pinned = get_gnome_favorite_desktop_ids();
-    const char* source = "GNOME favourites";
-    if (config.pinned.empty()) {
-        config.pinned = builtin_default_pinned(catalog);
-        source = "installed-application defaults";
-    }
-
-    // Drop anything that is not actually installed, so a first run never
-    // produces slots for applications that cannot launch.
-    std::vector<std::string> present;
-    for (const auto& desktop_id : config.pinned) {
-        if (catalog.find(desktop_id) != catalog.end()) {
-            present.push_back(desktop_id);
-        }
-    }
-    config.pinned = std::move(present);
-
-    if (write_config(config)) {
-        g_message("Created %s from %s (%zu applications).",
-                  config_file_path().c_str(), source, config.pinned.size());
-    }
-    return config;
-}
-
 std::vector<DesktopApp> load_dock_apps(const DockConfig& config,
                                        const std::map<std::string, DesktopCatalogEntry>& catalog) {
     const auto& favorites = config.pinned;
@@ -848,6 +481,14 @@ class DockEngine {
         panel_fixed_ = gtk_fixed_new();
         gtk_fixed_put(GTK_FIXED(root_fixed_), panel_fixed_, 0.0, 0.0);
 
+        // Added last so it draws over the items, and parented to root_fixed_
+        // rather than the panel so it can sit above the panel's top edge.
+        tooltip_ = gtk_label_new("");
+        gtk_widget_add_css_class(tooltip_, "dock-tooltip");
+        gtk_widget_set_visible(tooltip_, FALSE);
+        gtk_widget_set_can_target(tooltip_, FALSE);
+        gtk_fixed_put(GTK_FIXED(root_fixed_), tooltip_, 0.0, 0.0);
+
         build_icons(dock_apps);
 
         GtkEventController* motion = gtk_event_controller_motion_new();
@@ -916,6 +557,54 @@ class DockEngine {
         return PANEL_BG_HEIGHT + (max_icon_px() - BASE_ICON_PX) + BOTTOM_MARGIN + TOP_SLACK;
     }
 
+    // Which item is under this x, in root_fixed_ coordinates. Uses the animated
+    // width, so the label tracks the icon it belongs to as that icon grows.
+    std::optional<std::size_t> icon_at(double x) const {
+        for (std::size_t i = 0; i < icons_.size(); ++i) {
+            const double left = panel_x_ + icons_[i].panel_x;
+            if (x >= left && x <= left + icons_[i].current_width) {
+                return i;
+            }
+        }
+        return std::nullopt;
+    }
+
+    // Centred over the hovered icon and sitting above it, repositioned every
+    // frame so it rides the magnification rather than lagging behind it.
+    void update_tooltip(int win_w) {
+        if (tooltip_ == nullptr) {
+            return;
+        }
+
+        if (!hovered_index_.has_value() || *hovered_index_ >= icons_.size()) {
+            gtk_widget_set_visible(tooltip_, FALSE);
+            return;
+        }
+
+        const IconRuntime& icon = icons_[*hovered_index_];
+        if (icon.title != tooltip_text_) {
+            tooltip_text_ = icon.title;
+            gtk_label_set_text(GTK_LABEL(tooltip_), tooltip_text_.c_str());
+        }
+        gtk_widget_set_visible(tooltip_, TRUE);
+
+        int natural_w = 0;
+        int natural_h = 0;
+        gtk_widget_measure(tooltip_, GTK_ORIENTATION_HORIZONTAL, -1, nullptr, &natural_w,
+                           nullptr, nullptr);
+        gtk_widget_measure(tooltip_, GTK_ORIENTATION_VERTICAL, natural_w, nullptr, &natural_h,
+                           nullptr, nullptr);
+
+        const double centre = panel_x_ + icon.panel_x + icon.current_width / 2.0;
+        double x = centre - natural_w / 2.0;
+        // Keep it on screen for the first and last items rather than letting it
+        // run off the edge.
+        x = std::clamp(x, 0.0, std::max(0.0, static_cast<double>(win_w - natural_w)));
+
+        const double y = icon_baseline_y_ - icon.current_width - TOOLTIP_GAP - natural_h;
+        gtk_fixed_move(GTK_FIXED(root_fixed_), tooltip_, x, std::max(0.0, y));
+    }
+
     bool pointer_is_on_panel(double x, double y) const {
         if (panel_content_width_ <= 0) {
             return false;
@@ -953,8 +642,9 @@ class DockEngine {
         if (!self->pointer_is_on_panel(x, y)) {
             // Off the panel is off the dock, even though it is still inside the
             // window. Same effect as leaving.
-            if (self->current_mouse_x_.has_value()) {
+            if (self->current_mouse_x_.has_value() || self->hovered_index_.has_value()) {
                 self->current_mouse_x_.reset();
+                self->hovered_index_.reset();
                 self->queue_layout();
             }
             return;
@@ -964,6 +654,7 @@ class DockEngine {
         // target; the tick callback does the work at frame rate. Throttling
         // here was what made pointer tracking feel steppy.
         self->current_mouse_x_ = x;
+        self->hovered_index_ = self->icon_at(x);
         self->layout_dirty_ = true;
         self->ensure_tick();
     }
@@ -971,6 +662,7 @@ class DockEngine {
     static void on_leave_static(GtkEventControllerMotion*, gpointer user_data) {
         auto* self = static_cast<DockEngine*>(user_data);
         self->current_mouse_x_.reset();
+        self->hovered_index_.reset();
         self->queue_layout();
     }
 
@@ -1359,6 +1051,8 @@ class DockEngine {
         for (auto& icon : icons_) {
             update_icon_internal_layout(icon);
         }
+
+        update_tooltip(gtk_widget_get_width(window_));
     }
 
     void update_icon_internal_layout(IconRuntime& icon) {
@@ -1478,7 +1172,6 @@ class DockEngine {
             icon.button = gtk_button_new();
             gtk_widget_add_css_class(icon.button, "dock-item");
             gtk_widget_set_can_focus(icon.button, FALSE);
-            gtk_widget_set_tooltip_text(icon.button, icon.title.c_str());
 
             icon.fixed = gtk_fixed_new();
             gtk_button_set_child(GTK_BUTTON(icon.button), icon.fixed);
@@ -1566,6 +1259,7 @@ class DockEngine {
         g_object_unref(magnification);
 
         for (const auto& [name, handler] : {
+                 std::pair<const char*, GCallback>{"settings", G_CALLBACK(&DockEngine::on_settings_static)},
                  std::pair<const char*, GCallback>{"edit-config", G_CALLBACK(&DockEngine::on_edit_config_static)},
                  std::pair<const char*, GCallback>{"reload-config", G_CALLBACK(&DockEngine::on_reload_config_static)},
                  std::pair<const char*, GCallback>{"quit", G_CALLBACK(&DockEngine::on_quit_action_static)}}) {
@@ -1585,9 +1279,7 @@ class DockEngine {
         g_object_unref(appearance);
 
         GMenu* configuration = g_menu_new();
-        // Stands in for "Dock Settings..." until the settings widget exists.
-        // It edits the same file the settings application will, so the entry
-        // point moves later without the plumbing underneath it changing.
+        g_menu_append(configuration, "Dock Settings\u2026", "dock.settings");
         g_menu_append(configuration, "Edit Configuration File\u2026", "dock.edit-config");
         g_menu_append(configuration, "Reload Configuration", "dock.reload-config");
         g_menu_append_section(menu, nullptr, G_MENU_MODEL(configuration));
@@ -1628,6 +1320,49 @@ class DockEngine {
         self->config_.magnification = enabled;
         write_config(self->config_);
         self->queue_layout();
+    }
+
+    // Launch lucid-dock-settings. Looked up next to this binary first so a
+    // build tree works without installing, then on PATH. Falls back to opening
+    // the config file if the settings binary is not there at all -- the dock
+    // must not lose its settings entry point just because one of two binaries
+    // was deployed.
+    static void on_settings_static(GSimpleAction* action, GVariant* variant, gpointer user_data) {
+        auto* self = static_cast<DockEngine*>(user_data);
+
+        std::string program;
+        gchar* self_path = g_file_read_link("/proc/self/exe", nullptr);
+        if (self_path != nullptr) {
+            const std::filesystem::path sibling =
+                std::filesystem::path(self_path).parent_path() / "lucid_dock_settings";
+            if (std::filesystem::is_regular_file(sibling)) {
+                program = sibling.string();
+            }
+            g_free(self_path);
+        }
+        if (program.empty()) {
+            gchar* found = g_find_program_in_path("lucid_dock_settings");
+            if (found != nullptr) {
+                program = found;
+                g_free(found);
+            }
+        }
+        if (program.empty()) {
+            g_message("lucid_dock_settings not found; opening the configuration file instead.");
+            on_edit_config_static(action, variant, user_data);
+            return;
+        }
+
+        const gchar* argv[] = {program.c_str(), nullptr};
+        GError* error = nullptr;
+        if (!g_spawn_async(nullptr, const_cast<gchar**>(argv), nullptr, G_SPAWN_DEFAULT,
+                           nullptr, nullptr, nullptr, &error)) {
+            g_warning("Could not launch %s: %s", program.c_str(),
+                      error != nullptr ? error->message : "unknown error");
+            g_clear_error(&error);
+            on_edit_config_static(action, variant, user_data);
+        }
+        (void)self;
     }
 
     static void on_edit_config_static(GSimpleAction*, GVariant*, gpointer user_data) {
@@ -1753,6 +1488,20 @@ window {
     margin: 0;
 }
 
+/* The reference has no transition on this: display none to display block, so
+   it is up on the same frame the pointer arrives. GTK has no backdrop-filter,
+   so the translucency is raised slightly to stand in for the 5px blur. */
+.dock-tooltip {
+    background-color: rgba(252, 252, 252, 0.72);
+    color: rgba(16, 16, 16, 0.95);
+    border-radius: 6px;
+    padding: 6px 12px;
+    box-shadow:
+        inset 0 0 0 1px rgba(255, 255, 255, 0.30),
+        0 1px 5px 2px rgba(0, 0, 0, 0.30);
+    font-size: 0.95em;
+}
+
 .dock-divider {
     background-color: rgba(20, 20, 20, 0.30);
 }
@@ -1791,6 +1540,9 @@ window {
     GtkWidget* root_fixed_ = nullptr;
     GtkWidget* panel_bg_ = nullptr;
     GtkWidget* panel_fixed_ = nullptr;
+    GtkWidget* tooltip_ = nullptr;
+    std::string tooltip_text_;
+    std::optional<std::size_t> hovered_index_;
 
     std::vector<IconRuntime> icons_;
     MagnificationProfile magnifier_;

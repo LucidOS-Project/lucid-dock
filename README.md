@@ -10,6 +10,9 @@ LucidOS desktop is built around (see "Why out-of-process" below).
 | Path | What it is |
 |---|---|
 | `macoswebproto/lucid_dock.cpp` | Primary implementation (C++20, GTK4, layer-shell) |
+| `macoswebproto/dock_config.h` | Config + `.desktop` catalogue, shared by both binaries |
+| `macoswebproto/dock_settings_page.cpp` | The settings UI, as a widget |
+| `macoswebproto/lucid_dock_settings.cpp` | ~20 line wrapper making that widget a window |
 | `macoswebproto/lucid_dock.py` | Python implementation of the same design |
 | `macoswebproto/CMakeLists.txt` | CMake build |
 | `macoswebproto/build_lucid_dock.sh` | Direct g++ build |
@@ -172,6 +175,58 @@ Sizes are quantised, positions are not: they accumulate from the unrounded
 widths and go through `gtk_fixed_move()`, which takes doubles. Moving every icon
 every frame instead of only on a rounding change costs nothing measurable --
 `layout_panel()` p50 0.088 ms, still 60 fps.
+
+## Settings
+
+    ./lucid_dock_settings
+
+Also reachable from the dock's right-click menu, which looks for the binary
+beside itself first so a build tree works uninstalled, then on `PATH`, and falls
+back to opening the config file if neither is there.
+
+**It is a widget, not a window,** and that is the entire reason it is a separate
+file. `dock_settings_page.cpp` exposes exactly one symbol:
+
+    GtkWidget* lucid_dock_settings_page_new(void);
+
+Today a ~20 line `main()` wraps that in a `GtkWindow`. When LucidOS Settings
+exists it compiles the same file and drops the same widget into a stack page --
+no extraction, no rework. Built as a window instead, that step is a gutting job.
+
+It talks to the dock through `~/.config/lucid/dock.conf` and nothing else: it
+writes, the dock's `GFileMonitor` notices, the change applies live. No IPC, no
+D-Bus, no protocol between the two processes, and no reason for either binary to
+know the other is running.
+
+Controls: magnification on/off, maximum size, tracking speed, and the pinned
+list with reorder, remove, add, and a per-row "Separator before" toggle -- a
+separator belongs to the app it precedes, so that is where the control for it
+belongs, rather than in a second list to be kept in step by hand.
+
+`dock_config.h` is header-only. The shared surface is a config struct, a
+`.desktop` catalogue, and the functions that read and write them; a static
+library would be more build system than that is worth.
+
+## The name label
+
+Hovering an item shows its name above it, immediately.
+
+Immediately is the whole specification. The reference has **no transition on it
+at all** -- `display: none` to `display: block` -- so the label is up on the
+frame the pointer arrives. GTK's stock tooltip, which is what the dock used
+before, waits about 500 ms by design; that delay is the entire difference
+between "the dock is telling me what this is" and "a tooltip appeared".
+
+The label is parented to `root_fixed_` rather than the panel, so it can sit
+above the panel's top edge, and it is repositioned every frame from the icon's
+animated width so it rides the magnification instead of trailing it. GTK has no
+`backdrop-filter`, so the reference's 50%-white-plus-5px-blur is approximated
+with a slightly more opaque fill.
+
+It needs headroom, so the surface is now 198 px rather than 160 at `MaxScale`
+2.0. **Known consequence:** the dock's surface is monitor-wide and now taller,
+and a layer surface takes pointer input across its whole area unless an input
+region is set, which GTK does not expose. Worth fixing before this ships.
 
 ## Right-click menu
 

@@ -31,3 +31,9 @@ g++ -std=c++20 -O2 -DHAVE_GTK4_LAYER_SHELL=1 lucid_dock.cpp -o lucid_dock_cpp \
     $(pkg-config --cflags --libs gtk4-layer-shell-0 gtk4 gio-unix-2.0) \
     ${LUCID_RPATH:+-Wl,-rpath,"$LUCID_RPATH"}
 echo "Built ./lucid_dock_cpp"
+
+# The settings UI is a separate binary sharing dock_config.h. It has no
+# layer-shell dependency -- it is an ordinary window.
+g++ -std=c++20 -O2 dock_settings_page.cpp lucid_dock_settings.cpp -o lucid_dock_settings \
+    $(pkg-config --cflags --libs gtk4 gio-unix-2.0)
+echo "Built ./lucid_dock_settings"
