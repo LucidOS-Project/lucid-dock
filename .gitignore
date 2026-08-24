@@ -1,6 +1,7 @@
-build/
-__pycache__/
-*.pyc
-lucid_dock_cpp
-.DS_Store
 ._*
+build/
+.DS_Store
+lucid_dock_cpp
+lucid_dock_settings
+*.pyc
+__pycache__/
