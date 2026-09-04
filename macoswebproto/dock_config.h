@@ -43,6 +43,61 @@ inline std::optional<std::string> load_keyfile_value(GKeyFile* key_file, const c
     return result;
 }
 
+// The desktops this session claims to be, from XDG_CURRENT_DESKTOP.
+inline const std::vector<std::string>& current_desktop_names() {
+    static const std::vector<std::string> names = [] {
+        std::vector<std::string> out;
+        const char* value = g_getenv("XDG_CURRENT_DESKTOP");
+        if (value != nullptr) {
+            gchar** parts = g_strsplit(value, ":", -1);
+            for (gchar** it = parts; it != nullptr && *it != nullptr; ++it) {
+                if (**it != '\0') {
+                    out.emplace_back(*it);
+                }
+            }
+            g_strfreev(parts);
+        }
+        return out;
+    }();
+    return names;
+}
+
+inline bool desktop_entry_shows_here(GKeyFile* key_file) {
+    const auto& here = current_desktop_names();
+    auto listed = [&](const char* key) {
+        gsize count = 0;
+        gchar** values =
+            g_key_file_get_string_list(key_file, "Desktop Entry", key, &count, nullptr);
+        if (values == nullptr) {
+            return false;   // key absent
+        }
+        bool found = false;
+        for (gsize i = 0; i < count && !found; ++i) {
+            for (const auto& name : here) {
+                if (g_ascii_strcasecmp(values[i], name.c_str()) == 0) {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        g_strfreev(values);
+        return found;
+    };
+
+    gsize only_count = 0;
+    gchar** only = g_key_file_get_string_list(key_file, "Desktop Entry", "OnlyShowIn",
+                                              &only_count, nullptr);
+    const bool has_only = only != nullptr;
+    if (only != nullptr) {
+        g_strfreev(only);
+    }
+
+    if (has_only && !listed("OnlyShowIn")) {
+        return false;
+    }
+    return !listed("NotShowIn");
+}
+
 inline bool load_desktop_info(const std::filesystem::path& desktop_path, DesktopCatalogEntry& entry) {
     GKeyFile* key_file = g_key_file_new();
     GError* error = nullptr;
@@ -72,6 +127,21 @@ inline bool load_desktop_info(const std::filesystem::path& desktop_path, Desktop
         g_error_free(hidden_error);
     }
     if (nodisplay) {
+        g_key_file_unref(key_file);
+        return false;
+    }
+
+    // OnlyShowIn / NotShowIn, per the Desktop Entry spec. Without this the
+    // catalog carries desktop-specific duplicates -- Zorin ships both
+    // gnome-system-monitor-kde.desktop (OnlyShowIn=KDE) and
+    // org.gnome.SystemMonitor.desktop (NotShowIn=KDE) for one binary, so the
+    // dock showed System Monitor twice for a single running copy.
+    //
+    // XDG_CURRENT_DESKTOP is a colon-separated list precisely so a desktop can
+    // inherit another's entries: Zorin sets "zorin:GNOME". LucidOS should set
+    // something like "LucidOS:GNOME" for the same reason, or every entry with
+    // OnlyShowIn=GNOME disappears.
+    if (!desktop_entry_shows_here(key_file)) {
         g_key_file_unref(key_file);
         return false;
     }
@@ -147,6 +217,9 @@ struct DockConfig {
     std::vector<std::string> pinned;
     std::vector<std::string> dividers_before;
     bool magnification = true;
+    // Show applications that are running but not pinned, after the pinned ones
+    // and behind a separator. They leave again when the application quits.
+    bool show_running = true;
     // Peak magnification, as a multiple of the icon size. The reference uses 2.
     double max_scale = 2.0;
     // How far the magnification reaches, in icon widths either side of the
@@ -208,6 +281,14 @@ inline bool read_config(DockConfig& config) {
         g_clear_error(&error);
     }
 
+    const gboolean show_running =
+        g_key_file_get_boolean(keyfile, kConfigGroup, "ShowRunning", &error);
+    if (error == nullptr) {
+        config.show_running = show_running != FALSE;
+    } else {
+        g_clear_error(&error);
+    }
+
     for (const auto& [key, target, lo, hi] : {
              std::tuple<const char*, double*, double, double>{"MaxScale", &config.max_scale, 1.0, 3.0},
              std::tuple<const char*, double*, double, double>{"Spread", &config.spread, 1.5, 8.0}}) {
@@ -260,12 +341,15 @@ inline bool write_config(const DockConfig& config) {
     set_key_string_list(keyfile, "Pinned", config.pinned);
     set_key_string_list(keyfile, "DividersBefore", config.dividers_before);
     g_key_file_set_boolean(keyfile, kConfigGroup, "Magnification", config.magnification ? TRUE : FALSE);
+    g_key_file_set_boolean(keyfile, kConfigGroup, "ShowRunning", config.show_running ? TRUE : FALSE);
     g_key_file_set_double(keyfile, kConfigGroup, "MaxScale", config.max_scale);
     g_key_file_set_double(keyfile, kConfigGroup, "Spread", config.spread);
     g_key_file_set_integer(keyfile, kConfigGroup, "IconSize", config.icon_size);
     g_key_file_set_string(keyfile, kConfigGroup, "LayoutMode", config.layout_mode.c_str());
     g_key_file_set_string(keyfile, kConfigGroup, "Position", config.position.c_str());
 
+    g_key_file_set_comment(keyfile, kConfigGroup, "ShowRunning",
+        " Also show running applications that are not pinned.", nullptr);
     g_key_file_set_comment(keyfile, kConfigGroup, "Pinned",
         " Desktop file IDs, in the order they appear on the dock.", nullptr);
     g_key_file_set_comment(keyfile, kConfigGroup, "DividersBefore",

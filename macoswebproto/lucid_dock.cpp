@@ -153,6 +153,9 @@ struct DesktopApp {
     std::vector<std::string> process_candidates;
     bool is_open = false;
     bool divider_before = false;
+    // False for an application that is on the dock only because it is running.
+    // It leaves when the application quits, and is not written to Pinned.
+    bool pinned = true;
 };
 
 struct IconRuntime {
@@ -187,6 +190,8 @@ struct IconRuntime {
     int last_dot_y = -1;
     double panel_x = -1.0;
     bool is_open = false;
+
+    bool pinned = true;
 
     // A separator drawn immediately before this item. Owned here rather than in
     // a parallel list so it cannot fall out of step with the icon order.
@@ -305,7 +310,77 @@ std::vector<DesktopApp> load_dock_apps(const DockConfig& config,
             .process_candidates = candidates,
             .is_open = is_open,
             .divider_before = divider_before,
+            .pinned = true,
         });
+    }
+
+    if (!config.show_running) {
+        return apps;
+    }
+
+    // Applications that are running but not pinned, appended behind a
+    // separator. Matching is by process name derived from the Exec line, which
+    // is a heuristic but a portable one: it needs nothing from the compositor
+    // and works identically on GNOME, KDE, sway and Hyprland.
+    //
+    // The better answer once LucidOS is on its own compositor is
+    // ext-foreign-toplevel-list-v1, which enumerates actual windows rather than
+    // guessing from processes. It reports what has a window instead of what has
+    // a process, so it does not miss Flatpak apps whose binary name differs
+    // from the desktop id, and does not show background daemons. Mutter does
+    // not implement it, but neither does it implement layer-shell, so on every
+    // compositor this dock can anchor to, the protocol is available.
+    std::vector<std::string> pinned_ids(favorites.begin(), favorites.end());
+    std::unordered_set<std::string> seen_processes;
+    bool first_unpinned = true;
+
+    // A pinned icon already represents its process, so an unpinned entry that
+    // resolves to the same binary must not appear a second time.
+    for (const auto& app : apps) {
+        for (const auto& candidate : app.process_candidates) {
+            if (running_names.find(candidate) != running_names.end()) {
+                seen_processes.insert(candidate);
+            }
+        }
+    }
+
+    for (const auto& [desktop_id, entry] : catalog) {
+        if (std::find(pinned_ids.begin(), pinned_ids.end(), desktop_id) != pinned_ids.end()) {
+            continue;
+        }
+
+        const auto candidates = exec_candidates(entry.exec_line, desktop_id);
+        if (candidates.empty()) {
+            continue;
+        }
+        const auto match = std::find_if(
+            candidates.begin(), candidates.end(), [&](const std::string& candidate) {
+                return running_names.find(candidate) != running_names.end();
+            });
+        if (match == candidates.end()) {
+            continue;
+        }
+
+        // One process, one icon. Several desktop files can launch the same
+        // binary -- a KDE-specific variant beside the plain one, say -- and
+        // matching by process name finds all of them, so the dock would show
+        // System Monitor twice for a single running copy.
+        if (!seen_processes.insert(*match).second) {
+            continue;
+        }
+
+        apps.push_back(DesktopApp{
+            .app_id = std::filesystem::path(desktop_id).stem().string(),
+            .title = entry.title,
+            .desktop_path = entry.desktop_path,
+            .icon_name = entry.icon_name,
+            .exec_line = entry.exec_line,
+            .process_candidates = candidates,
+            .is_open = true,
+            .divider_before = first_unpinned,
+            .pinned = false,
+        });
+        first_unpinned = false;
     }
 
     return apps;
@@ -1380,6 +1455,7 @@ class DockEngine {
             IconRuntime icon;
             icon.app_id = app.app_id;
             icon.desktop_id = app.desktop_path.filename().string();
+            icon.pinned = app.pinned;
             icon.title = app.title;
             icon.desktop_path = app.desktop_path;
             icon.icon_name = app.icon_name;
@@ -1517,11 +1593,50 @@ class DockEngine {
     static void on_reorder_end_static(GtkGestureDrag*, double, double, gpointer user_data) {
         auto* self = static_cast<DockEngine*>(user_data);
         const bool moved = self->dragging_;
+        const auto index = self->drag_from_;
         self->dragging_ = false;
         self->drag_from_ = std::nullopt;
-        if (moved) {
-            self->persist_order();
+        if (!moved) {
+            return;
         }
+
+        // Deliberately placing a running application means keeping it. A drag
+        // that snapped back when the app quit would make the gesture feel
+        // broken, so dropping it pins it where it was dropped.
+        if (index.has_value() && *index < self->icons_.size() &&
+            !self->icons_[*index].pinned) {
+            self->icons_[*index].pinned = true;
+            self->icons_[*index].divider_before = false;
+            self->refresh_running_divider();
+        }
+        self->persist_order();
+    }
+
+    // The separator marks where pinned items end. After anything is pinned or
+    // unpinned it belongs before the first remaining running-only icon, and
+    // nowhere else.
+    void refresh_running_divider() {
+        bool first = true;
+        for (auto& icon : icons_) {
+            if (icon.pinned) {
+                continue;
+            }
+            const bool want = first;
+            first = false;
+            if (icon.divider_before == want) {
+                continue;
+            }
+            icon.divider_before = want;
+            if (want && icon.divider == nullptr) {
+                icon.divider = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+                gtk_widget_add_css_class(icon.divider, "dock-divider");
+                gtk_fixed_put(GTK_FIXED(panel_fixed_), icon.divider, 0.0, 0.0);
+            } else if (!want && icon.divider != nullptr) {
+                gtk_fixed_remove(GTK_FIXED(panel_fixed_), icon.divider);
+                icon.divider = nullptr;
+            }
+        }
+        queue_layout();
     }
 
     // Rewrite Pinned from the on-screen order. Anything in the config that has
@@ -1532,7 +1647,10 @@ class DockEngine {
         std::vector<std::string> order;
         order.reserve(icons_.size());
         for (const auto& icon : icons_) {
-            if (!icon.desktop_id.empty()) {
+            // Running-but-unpinned icons are on the dock transiently and must
+            // not be written to Pinned, or quitting an app would leave it
+            // pinned behind and the dock would only ever grow.
+            if (icon.pinned && !icon.desktop_id.empty()) {
                 order.push_back(icon.desktop_id);
             }
         }
@@ -1567,6 +1685,49 @@ class DockEngine {
                 icon.launch_pending_since.reset();
             }
         }
+
+        if (config_.show_running) {
+            sync_running_items();
+        }
+    }
+
+    // An application starting or quitting changes which icons exist, which is
+    // a rebuild. Comparing the set first matters: rebuilding unconditionally
+    // every four seconds would restart every animation and make the dock twitch
+    // on a timer.
+    void sync_running_items() {
+        const auto catalog = load_desktop_catalog();
+        std::vector<std::string> want;
+        for (const auto& app : load_dock_apps(config_, catalog)) {
+            want.push_back(app.desktop_path.filename().string());
+        }
+
+        std::vector<std::string> have;
+        have.reserve(icons_.size());
+        for (const auto& icon : icons_) {
+            have.push_back(icon.desktop_id);
+        }
+        if (want == have) {
+            return;
+        }
+
+        // Carry the animated width across the rebuild so icons that survive it
+        // do not snap back to rest under the pointer.
+        std::map<std::string, std::pair<double, double>> carried;
+        for (const auto& icon : icons_) {
+            carried[icon.desktop_id] = {icon.current_width, icon.width_velocity};
+        }
+
+        rebuild_items();
+
+        for (auto& icon : icons_) {
+            const auto it = carried.find(icon.desktop_id);
+            if (it != carried.end()) {
+                icon.current_width = it->second.first;
+                icon.width_velocity = it->second.second;
+            }
+        }
+        queue_layout();
     }
 
     // While something is starting, poll far more often than the idle 4 s
