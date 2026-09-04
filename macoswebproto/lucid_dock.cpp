@@ -172,6 +172,14 @@ struct IconRuntime {
 
     double current_width = BASE_WIDTH;   // animated
     double width_velocity = 0.0;         // px/s, carried across frames by the spring
+
+    // Horizontal displacement from this icon's laid-out slot, sprung to zero.
+    // A reorder sets it to "where I used to be minus where I now am", so the
+    // icon starts drawn in its old place and slides to the new one. The slot
+    // itself changes instantly; only the drawing lags, which is what makes the
+    // swap read as motion rather than a jump.
+    double x_offset = 0.0;
+    double x_offset_velocity = 0.0;
     double target_width = BASE_WIDTH;    // where the pointer says it should be
     double bounce_offset = 0.0;
     std::optional<double> bounce_started_at;
@@ -188,7 +196,8 @@ struct IconRuntime {
     double last_image_y = -1.0;
     int last_dot_x = -1;
     int last_dot_y = -1;
-    double panel_x = -1.0;
+    double panel_x = -1.0;   // laid-out slot
+    double drawn_x = -1.0;   // where the widget actually is
     bool is_open = false;
 
     bool pinned = true;
@@ -899,6 +908,40 @@ class DockEngine {
         ensure_tick();
     }
 
+    // One underdamped spring, solved in closed form, shared by the magnification
+    // envelope and the reorder slide so the dock only ever has one feel. Returns
+    // true while still moving.
+    static bool spring_step(double& value, double& velocity, double target, double dt,
+                            double settle, double settle_velocity) {
+        const double a = value - target;
+        if (std::abs(a) <= settle && std::abs(velocity) <= settle_velocity) {
+            value = target;
+            velocity = 0.0;
+            return false;
+        }
+        const double sigma = SPRING_ZETA * SPRING_OMEGA;
+        const double omega_d = SPRING_OMEGA * std::sqrt(1.0 - SPRING_ZETA * SPRING_ZETA);
+        const double decay = std::exp(-sigma * dt);
+        const double cos_wd = std::cos(omega_d * dt);
+        const double sin_wd = std::sin(omega_d * dt);
+        const double b = (velocity + sigma * a) / omega_d;
+        value = target + decay * (a * cos_wd + b * sin_wd);
+        velocity = decay * ((omega_d * b - sigma * a) * cos_wd -
+                            (omega_d * a + sigma * b) * sin_wd);
+        return true;
+    }
+
+    // Slide every icon back toward its slot.
+    bool step_offsets(double dt) {
+        bool moving = false;
+        for (auto& icon : icons_) {
+            if (spring_step(icon.x_offset, icon.x_offset_velocity, 0.0, dt, 0.05, 0.5)) {
+                moving = true;
+            }
+        }
+        return moving;
+    }
+
     // Advance the width spring by dt, using the closed-form solution of the
     // underdamped spring rather than a stepped integrator. That matters here:
     // a stepped integrator's behaviour depends on how often it is called, and
@@ -934,7 +977,13 @@ class DockEngine {
         // position instead makes the two circular: the target stays 1 because
         // the position is set, and the position is only cleared once the target
         // reaches 0. The dock then magnifies on first hover and never shrinks.
-        const double target = (current_mouse_x_.has_value() && config_.magnification) ? 1.0 : 0.0;
+        // Dragging collapses the dock to rest size. Magnifying under the
+        // pointer while an icon is being carried makes every slot a moving
+        // target and the drop position impossible to judge -- macOS shrinks for
+        // the same reason. The envelope already springs, so this shrinks and
+        // grows back smoothly with no extra animation code.
+        const double target =
+            (current_mouse_x_.has_value() && config_.magnification && !dragging_) ? 1.0 : 0.0;
 
         const double sigma = SPRING_ZETA * SPRING_OMEGA;
         const double omega_d = SPRING_OMEGA * std::sqrt(1.0 - SPRING_ZETA * SPRING_ZETA);
@@ -1064,7 +1113,8 @@ class DockEngine {
         }
 
         const bool widths_moving = step_widths(dt);
-        animations_running = animations_running || widths_moving;
+        const bool offsets_moving = step_offsets(dt);
+        animations_running = animations_running || widths_moving || offsets_moving;
 
         if (g_getenv("LUCID_BENCH_IDLE") != nullptr) {
             layout_dirty_ = false;
@@ -1286,14 +1336,39 @@ class DockEngine {
                     cursor += DIVIDER_SLOT;
                 }
 
-                if (std::abs(icon.panel_x - cursor) > kPositionEpsilon) {
-                    icon.panel_x = cursor;
-                    gtk_fixed_move(GTK_FIXED(panel_fixed_), icon.button, cursor,
+                icon.panel_x = cursor;
+
+                // Second half of the FLIP: the slot moved instantly, so start
+                // the drawing where the icon used to be and let the spring
+                // close the gap.
+                const auto flip = pending_flip_.find(icon.desktop_id);
+                if (flip != pending_flip_.end()) {
+                    icon.x_offset = flip->second - cursor;
+                    icon.x_offset_velocity = 0.0;
+                }
+
+                double draw_x = cursor + icon.x_offset;
+
+                // The icon being carried is not in its slot: it is under the
+                // pointer, and its slot is the gap it will drop into. Drawn
+                // directly rather than sprung, because a lag between the
+                // pointer and the thing it is holding feels like the drag has
+                // come loose.
+                const bool is_carried =
+                    dragging_ && drag_from_.has_value() && i == *drag_from_;
+                if (is_carried) {
+                    draw_x = drag_pointer_x_ - panel_x_ - icon.current_width * 0.5;
+                }
+
+                if (std::abs(icon.drawn_x - draw_x) > kPositionEpsilon) {
+                    icon.drawn_x = draw_x;
+                    gtk_fixed_move(GTK_FIXED(panel_fixed_), icon.button, draw_x,
                                    static_cast<double>(PANEL_PADDING_Y));
                 }
                 cursor += icon.current_width + ITEM_GAP;
             }
 
+            pending_flip_.clear();
             last_applied_pixel_widths_ = std::move(pixel_widths);
         }
 
@@ -1568,6 +1643,8 @@ class DockEngine {
                 return;   // still a click
             }
             self->dragging_ = true;
+            self->drag_pointer_x_ = self->drag_origin_x_ + dx;
+            self->queue_layout();   // start the collapse immediately
             // Now it is a drag: take the sequence so the button underneath
             // does not also fire a click when the pointer is released.
             gtk_gesture_set_state(GTK_GESTURE(gesture), GTK_EVENT_SEQUENCE_CLAIMED);
@@ -1575,10 +1652,20 @@ class DockEngine {
         (void)dy;
 
         const double x = self->drag_origin_x_ + dx;
+        self->drag_pointer_x_ = x;
         const std::size_t from = *self->drag_from_;
         const std::size_t to = self->drop_slot_at(x);
         if (to == from) {
             return;
+        }
+
+        // FLIP: remember where everything is drawn now, reorder, and let
+        // layout turn the difference into an offset that springs back to zero.
+        // Reordering without this is correct and instant, which is exactly what
+        // makes it read as a glitch rather than a swap.
+        std::map<std::string, double> before;
+        for (const auto& icon : self->icons_) {
+            before[icon.desktop_id] = icon.panel_x + icon.x_offset;
         }
 
         IconRuntime moved = std::move(self->icons_[from]);
@@ -1587,6 +1674,7 @@ class DockEngine {
         self->drag_from_ = to;
         self->current_mouse_x_ = x;
         self->hovered_index_ = to;
+        self->pending_flip_ = std::move(before);
         self->queue_layout();
     }
 
@@ -1594,8 +1682,18 @@ class DockEngine {
         auto* self = static_cast<DockEngine*>(user_data);
         const bool moved = self->dragging_;
         const auto index = self->drag_from_;
+
+        // Where the carried icon was last drawn, so releasing it slides it into
+        // the slot rather than teleporting it there.
+        if (moved && index.has_value() && *index < self->icons_.size()) {
+            auto& icon = self->icons_[*index];
+            icon.x_offset = icon.drawn_x - icon.panel_x;
+            icon.x_offset_velocity = 0.0;
+        }
+
         self->dragging_ = false;
         self->drag_from_ = std::nullopt;
+        self->queue_layout();
         if (!moved) {
             return;
         }
@@ -2081,7 +2179,9 @@ window {
 
     std::optional<std::size_t> drag_from_;
     double drag_origin_x_ = 0.0;
+    double drag_pointer_x_ = 0.0;
     bool dragging_ = false;
+    std::map<std::string, double> pending_flip_;
     std::vector<int> last_applied_pixel_widths_;
 
     std::optional<double> current_mouse_x_;
