@@ -296,55 +296,9 @@ inline bool write_config(const DockConfig& config) {
     return ok != FALSE;
 }
 
-// Is a GSettings schema actually installed? g_settings_new() on a missing
-// schema is a g_error(), which aborts the process -- so this is not a style
-// preference, it is the difference between running and not. The dock used to
-// call g_settings_new("org.gnome.shell") unguarded, which meant it died on
-// launch on KDE, sway, Hyprland and COSMIC: every compositor where layer-shell
-// actually works.
-inline bool gsettings_schema_installed(const char* schema_id) {
-    GSettingsSchemaSource* source = g_settings_schema_source_get_default();
-    if (source == nullptr) {
-        return false;
-    }
-
-    GSettingsSchema* schema = g_settings_schema_source_lookup(source, schema_id, TRUE);
-    if (schema == nullptr) {
-        return false;
-    }
-
-    g_settings_schema_unref(schema);
-    return true;
-}
-
-inline std::vector<std::string> get_gnome_favorite_desktop_ids() {
-    std::vector<std::string> favorites;
-
-    if (!gsettings_schema_installed("org.gnome.shell")) {
-        return favorites;
-    }
-
-    GSettings* settings = g_settings_new("org.gnome.shell");
-    if (settings == nullptr) {
-        return favorites;
-    }
-
-    gchar** values = g_settings_get_strv(settings, "favorite-apps");
-    if (values != nullptr) {
-        for (gchar** it = values; *it != nullptr; ++it) {
-            std::string desktop_id = *it;
-            if (desktop_id.size() >= 8 && desktop_id.rfind(".desktop") == desktop_id.size() - 8) {
-                favorites.push_back(std::move(desktop_id));
-            }
-        }
-        g_strfreev(values);
-    }
-
-    g_object_unref(settings);
-    return favorites;
-}
-
-
+// The default dock contents, chosen by role from what is actually installed.
+// Each row is one slot, listed most to least preferred, so the dock comes up
+// sensible on any desktop without asking any other desktop what it thinks.
 inline std::vector<std::string> builtin_default_pinned(
     const std::map<std::string, DesktopCatalogEntry>& catalog) {
     static const std::vector<std::vector<std::string>> kRoles = {
@@ -383,12 +337,12 @@ inline DockConfig ensure_config(const std::map<std::string, DesktopCatalogEntry>
         return config;
     }
 
-    config.pinned = get_gnome_favorite_desktop_ids();
-    const char* source = "GNOME favourites";
-    if (config.pinned.empty()) {
-        config.pinned = builtin_default_pinned(catalog);
-        source = "installed-application defaults";
-    }
+    // Seeded from what is actually installed, by role, never from another
+    // desktop's settings. Reading org.gnome.shell favorite-apps made a LucidOS
+    // dock depend on GNOME being present to know what to show -- wrong for a
+    // desktop that intends to replace it, and silently empty everywhere else.
+    config.pinned = builtin_default_pinned(catalog);
+    const char* source = "installed-application defaults";
 
     // Drop anything that is not actually installed, so a first run never
     // produces slots for applications that cannot launch.

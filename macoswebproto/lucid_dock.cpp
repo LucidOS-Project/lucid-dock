@@ -133,6 +133,17 @@ constexpr double ENVELOPE_SETTLE_VELOCITY = 0.02;
 constexpr double BOUNCE_HEIGHT = 40.0;
 constexpr double BOUNCE_DURATION = 0.4;
 
+// A launch keeps bouncing until the application actually appears, so the
+// animation answers "did my click work?" rather than just decorating it. It
+// gives up after LAUNCH_TIMEOUT so an app that never starts -- or one we
+// cannot match to a process -- stops bouncing rather than bouncing forever.
+constexpr double LAUNCH_TIMEOUT = 20.0;
+constexpr unsigned LAUNCH_POLL_MS = 400;
+
+// How far the pointer must travel before a press becomes a drag rather than a
+// click. Below this the button still gets its click.
+constexpr double REORDER_THRESHOLD = 8.0;
+
 struct DesktopApp {
     std::string app_id;
     std::string title;
@@ -161,6 +172,15 @@ struct IconRuntime {
     double target_width = BASE_WIDTH;    // where the pointer says it should be
     double bounce_offset = 0.0;
     std::optional<double> bounce_started_at;
+
+    // Set when we launch this app, cleared when its process shows up. While it
+    // is set the bounce restarts each time it finishes.
+    std::optional<double> launch_pending_since;
+
+    // The full desktop file id ("firefox.desktop"). app_id above is its stem,
+    // which is what process matching wants; this is what the config file's
+    // Pinned list is written in, so reordering needs it.
+    std::string desktop_id;
 
     double last_image_y = -1.0;
     int last_dot_x = -1;
@@ -544,6 +564,23 @@ class DockEngine {
         // they magnify. When icons grow their own context menu they can claim
         // this in the bubble phase and the dock menu keeps the background and
         // the separators.
+        // Drag to reorder. CAPTURE phase so it sees the press before the
+        // button does, but it does not claim the sequence until the pointer
+        // has actually travelled REORDER_THRESHOLD -- below that the press
+        // stays a click and still launches the app. Claiming immediately would
+        // mean the dock could be rearranged but never clicked.
+        GtkGesture* reorder = gtk_gesture_drag_new();
+        gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(reorder), GDK_BUTTON_PRIMARY);
+        gtk_event_controller_set_propagation_phase(GTK_EVENT_CONTROLLER(reorder),
+                                                   GTK_PHASE_CAPTURE);
+        g_signal_connect(reorder, "drag-begin",
+                         G_CALLBACK(&DockEngine::on_reorder_begin_static), this);
+        g_signal_connect(reorder, "drag-update",
+                         G_CALLBACK(&DockEngine::on_reorder_update_static), this);
+        g_signal_connect(reorder, "drag-end",
+                         G_CALLBACK(&DockEngine::on_reorder_end_static), this);
+        gtk_widget_add_controller(root_fixed_, GTK_EVENT_CONTROLLER(reorder));
+
         GtkGesture* secondary = gtk_gesture_click_new();
         gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(secondary), GDK_BUTTON_SECONDARY);
         gtk_event_controller_set_propagation_phase(GTK_EVENT_CONTROLLER(secondary), GTK_PHASE_CAPTURE);
@@ -714,23 +751,55 @@ class DockEngine {
         self->queue_layout();
     }
 
-    static void on_icon_clicked_static(GtkButton*, gpointer user_data) {
-        auto* icon = static_cast<IconRuntime*>(user_data);
-        icon->is_open = true;
-        icon->bounce_started_at = monotonic_seconds();
-        gtk_widget_set_visible(icon->dot, TRUE);
+    // The handler is given the engine and finds the icon by desktop id. It used
+    // to be handed &icons_.back() directly, which is a pointer into a vector --
+    // fine until the vector reorders or reallocates, at which point every
+    // button launches the wrong application. Reordering makes that reachable.
+    static void on_icon_clicked_static(GtkButton* button, gpointer user_data) {
+        auto* self = static_cast<DockEngine*>(user_data);
+        const char* id = static_cast<const char*>(
+            g_object_get_data(G_OBJECT(button), "lucid-desktop-id"));
+        if (id == nullptr) {
+            return;
+        }
+        IconRuntime* icon = self->icon_by_desktop_id(id);
+        if (icon == nullptr) {
+            return;
+        }
 
         if (!icon->desktop_path.empty()) {
-            GDesktopAppInfo* app_info = g_desktop_app_info_new_from_filename(icon->desktop_path.c_str());
+            GDesktopAppInfo* app_info =
+                g_desktop_app_info_new_from_filename(icon->desktop_path.c_str());
             if (app_info != nullptr) {
                 GError* error = nullptr;
-                if (!g_app_info_launch(G_APP_INFO(app_info), nullptr, nullptr, &error) && error != nullptr) {
+                if (!g_app_info_launch(G_APP_INFO(app_info), nullptr, nullptr, &error) &&
+                    error != nullptr) {
                     g_warning("Failed to launch %s: %s", icon->title.c_str(), error->message);
                     g_error_free(error);
+                    g_object_unref(app_info);
+                    return;
                 }
                 g_object_unref(app_info);
             }
         }
+
+        // Bounce until the process appears, not for a fixed 0.4 s. The dot
+        // stays hidden until it is genuinely running, so the two states mean
+        // different things: bouncing is "starting", dot is "running".
+        const double now = monotonic_seconds();
+        icon->bounce_started_at = now;
+        icon->launch_pending_since = now;
+        self->ensure_launch_poll();
+        self->ensure_tick();   // a click can arrive with the clock stopped
+    }
+
+    IconRuntime* icon_by_desktop_id(const std::string& id) {
+        for (auto& icon : icons_) {
+            if (icon.desktop_id == id) {
+                return &icon;
+            }
+        }
+        return nullptr;
     }
 
     static gboolean on_tick_static(GtkWidget*, GdkFrameClock* clock, gpointer user_data) {
@@ -962,8 +1031,16 @@ class DockEngine {
         }
 
         if (progress >= 1.0) {
-            icon.bounce_started_at.reset();
-            icon.bounce_offset = 0.0;
+            const bool still_launching =
+                icon.launch_pending_since.has_value() &&
+                (now - *icon.launch_pending_since) < LAUNCH_TIMEOUT && !icon.is_open;
+            if (still_launching) {
+                icon.bounce_started_at = now;      // go again
+            } else {
+                icon.bounce_started_at.reset();
+                icon.bounce_offset = 0.0;
+                icon.launch_pending_since.reset();
+            }
         }
 
         update_icon_internal_layout(icon);
@@ -1302,6 +1379,7 @@ class DockEngine {
         for (const auto& app : dock_apps) {
             IconRuntime icon;
             icon.app_id = app.app_id;
+            icon.desktop_id = app.desktop_path.filename().string();
             icon.title = app.title;
             icon.desktop_path = app.desktop_path;
             icon.icon_name = app.icon_name;
@@ -1358,8 +1436,116 @@ class DockEngine {
 
             icons_.push_back(std::move(icon));
             IconRuntime& new_icon = icons_.back();
-            g_signal_connect(new_icon.button, "clicked", G_CALLBACK(&DockEngine::on_icon_clicked_static), &new_icon);
+            g_object_set_data_full(G_OBJECT(new_icon.button), "lucid-desktop-id",
+                                   g_strdup(new_icon.desktop_id.c_str()), g_free);
+            g_signal_connect(new_icon.button, "clicked",
+                             G_CALLBACK(&DockEngine::on_icon_clicked_static), this);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Reordering
+    //
+    // The icon order and the config file's Pinned list are the same list. The
+    // drag reorders icons_ and then rewrites Pinned from it, so what is on
+    // screen and what is on disk cannot disagree -- there is no third copy to
+    // fall out of step.
+
+    // Which slot would an icon dropped at x land in? Unlike icon_at() this
+    // never returns nothing: a drag has to resolve to some slot, so a pointer
+    // past either end clamps to the first or last.
+    std::size_t drop_slot_at(double x) const {
+        if (icons_.empty()) {
+            return 0;
+        }
+        for (std::size_t i = 0; i < icons_.size(); ++i) {
+            const double left = panel_x_ + icons_[i].panel_x;
+            if (x < left + icons_[i].current_width * 0.5) {
+                return i;
+            }
+        }
+        return icons_.size() - 1;
+    }
+
+    static void on_reorder_begin_static(GtkGestureDrag* gesture, double x, double y,
+                                        gpointer user_data) {
+        auto* self = static_cast<DockEngine*>(user_data);
+        (void)gesture;
+        self->drag_from_ = std::nullopt;
+        self->dragging_ = false;
+        if (!self->pointer_is_on_panel(x, y)) {
+            return;
+        }
+        self->drag_origin_x_ = x;
+        self->drag_from_ = self->icon_at(x);
+    }
+
+    static void on_reorder_update_static(GtkGestureDrag* gesture, double dx, double dy,
+                                         gpointer user_data) {
+        auto* self = static_cast<DockEngine*>(user_data);
+        if (!self->drag_from_.has_value()) {
+            return;
+        }
+
+        if (!self->dragging_) {
+            if (std::abs(dx) < REORDER_THRESHOLD) {
+                return;   // still a click
+            }
+            self->dragging_ = true;
+            // Now it is a drag: take the sequence so the button underneath
+            // does not also fire a click when the pointer is released.
+            gtk_gesture_set_state(GTK_GESTURE(gesture), GTK_EVENT_SEQUENCE_CLAIMED);
+        }
+        (void)dy;
+
+        const double x = self->drag_origin_x_ + dx;
+        const std::size_t from = *self->drag_from_;
+        const std::size_t to = self->drop_slot_at(x);
+        if (to == from) {
+            return;
+        }
+
+        IconRuntime moved = std::move(self->icons_[from]);
+        self->icons_.erase(self->icons_.begin() + static_cast<long>(from));
+        self->icons_.insert(self->icons_.begin() + static_cast<long>(to), std::move(moved));
+        self->drag_from_ = to;
+        self->current_mouse_x_ = x;
+        self->hovered_index_ = to;
+        self->queue_layout();
+    }
+
+    static void on_reorder_end_static(GtkGestureDrag*, double, double, gpointer user_data) {
+        auto* self = static_cast<DockEngine*>(user_data);
+        const bool moved = self->dragging_;
+        self->dragging_ = false;
+        self->drag_from_ = std::nullopt;
+        if (moved) {
+            self->persist_order();
+        }
+    }
+
+    // Rewrite Pinned from the on-screen order. Anything in the config that has
+    // no icon -- an app that was uninstalled since the file was written -- is
+    // kept at the end rather than silently dropped, so pinning something,
+    // uninstalling it and reinstalling it does not lose its place.
+    void persist_order() {
+        std::vector<std::string> order;
+        order.reserve(icons_.size());
+        for (const auto& icon : icons_) {
+            if (!icon.desktop_id.empty()) {
+                order.push_back(icon.desktop_id);
+            }
+        }
+        for (const auto& id : config_.pinned) {
+            if (std::find(order.begin(), order.end(), id) == order.end()) {
+                order.push_back(id);
+            }
+        }
+        config_.pinned = std::move(order);
+
+        // Dividers are stored as "the item this one sits before", so they
+        // follow the icons automatically and need no separate fixing up.
+        write_config(config_);
     }
 
     void refresh_running_indicators() {
@@ -1374,6 +1560,43 @@ class DockEngine {
             }
             icon.is_open = is_open;
             gtk_widget_set_visible(icon.dot, is_open ? TRUE : FALSE);
+
+            // Appearing in the process list is what ends a launch. The bounce
+            // stops at the end of its current cycle rather than mid-air.
+            if (is_open) {
+                icon.launch_pending_since.reset();
+            }
+        }
+    }
+
+    // While something is starting, poll far more often than the idle 4 s
+    // refresh -- otherwise an app that opens in half a second still bounces for
+    // four. The fast timer stops itself as soon as nothing is pending.
+    static gboolean on_launch_poll_static(gpointer user_data) {
+        auto* self = static_cast<DockEngine*>(user_data);
+        self->refresh_running_indicators();
+
+        const double now = monotonic_seconds();
+        bool pending = false;
+        for (const auto& icon : self->icons_) {
+            if (icon.launch_pending_since.has_value() &&
+                (now - *icon.launch_pending_since) < LAUNCH_TIMEOUT) {
+                pending = true;
+                break;
+            }
+        }
+        if (!pending) {
+            self->launch_poll_id_ = 0;
+            return G_SOURCE_REMOVE;
+        }
+        self->ensure_tick();
+        return G_SOURCE_CONTINUE;
+    }
+
+    void ensure_launch_poll() {
+        if (launch_poll_id_ == 0) {
+            launch_poll_id_ = g_timeout_add(LAUNCH_POLL_MS,
+                                            &DockEngine::on_launch_poll_static, this);
         }
     }
 
@@ -1693,6 +1916,11 @@ window {
     GtkWidget* menu_ = nullptr;
     GSimpleActionGroup* actions_ = nullptr;
     GFileMonitor* config_monitor_ = nullptr;
+    guint launch_poll_id_ = 0;
+
+    std::optional<std::size_t> drag_from_;
+    double drag_origin_x_ = 0.0;
+    bool dragging_ = false;
     std::vector<int> last_applied_pixel_widths_;
 
     std::optional<double> current_mouse_x_;
