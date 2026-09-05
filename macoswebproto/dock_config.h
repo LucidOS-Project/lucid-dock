@@ -337,6 +337,18 @@ inline bool read_config(DockConfig& config) {
     }
 
     g_key_file_free(keyfile);
+    // Only the horizontal edges are implemented. left/right need the item
+    // strip laid out down the screen rather than across it, which is a
+    // different layout and not a flag -- so an unsupported value is corrected
+    // out loud instead of producing a dock in the wrong place.
+    if (config.position != "bottom" && config.position != "top") {
+        if (!config.position.empty()) {
+            g_warning("Position=%s is not implemented yet (only bottom and top). Using bottom.",
+                      config.position.c_str());
+        }
+        config.position = "bottom";
+    }
+
     return true;
 }
 

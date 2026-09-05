@@ -611,10 +611,15 @@ class DockEngine {
         } else {
         gtk_layer_init_for_window(GTK_WINDOW(window_));
         gtk_layer_set_layer(GTK_WINDOW(window_), GTK_LAYER_SHELL_LAYER_OVERLAY);
-        gtk_layer_set_anchor(GTK_WINDOW(window_), GTK_LAYER_SHELL_EDGE_BOTTOM, TRUE);
+        // Anchored to both sides as well as the docked edge, so the surface
+        // spans the output and the panel is centred inside it. Anchoring only
+        // the one edge would leave the surface its natural width and hand
+        // horizontal placement to the compositor.
+        const auto edge = at_top() ? GTK_LAYER_SHELL_EDGE_TOP : GTK_LAYER_SHELL_EDGE_BOTTOM;
+        gtk_layer_set_anchor(GTK_WINDOW(window_), edge, TRUE);
         gtk_layer_set_anchor(GTK_WINDOW(window_), GTK_LAYER_SHELL_EDGE_LEFT, TRUE);
         gtk_layer_set_anchor(GTK_WINDOW(window_), GTK_LAYER_SHELL_EDGE_RIGHT, TRUE);
-        gtk_layer_set_margin(GTK_WINDOW(window_), GTK_LAYER_SHELL_EDGE_BOTTOM, BOTTOM_MARGIN);
+        gtk_layer_set_margin(GTK_WINDOW(window_), edge, 0);
         gtk_layer_set_keyboard_mode(GTK_WINDOW(window_), GTK_LAYER_SHELL_KEYBOARD_MODE_ON_DEMAND);
         }
     #else
@@ -751,6 +756,23 @@ class DockEngine {
         return i > 0 && icons_[i].divider_before && icons_[i].divider != nullptr;
     }
 
+    // Everything about the edge lives behind these. "top" and "bottom" are a
+    // horizontal bar reflected vertically, which is a handful of sign flips.
+    // "left" and "right" are not: they need the item strip laid out down the
+    // screen instead of across it, and that is a different layout, not a flag.
+    // Rejected at load rather than half-implemented.
+    bool at_top() const { return config_.position == "top"; }
+
+    // Distance from the icon's slot to the icon itself, on the side away from
+    // the screen edge. Icons grow away from the edge they are docked to.
+    double icon_inset_y(double pixel_width) const {
+        return at_top() ? static_cast<double>(ICON_BOTTOM_INSET)
+                        : static_cast<double>(ITEM_SLOT_HEIGHT) - pixel_width - ICON_BOTTOM_INSET;
+    }
+
+    // The bounce moves away from the screen edge, so it flips with the edge.
+    double bounce_direction() const { return at_top() ? 1.0 : -1.0; }
+
     std::optional<std::size_t> icon_at(double x) const {
         for (std::size_t i = 0; i < icons_.size(); ++i) {
             const double left = panel_x_ + icons_[i].panel_x;
@@ -802,7 +824,9 @@ class DockEngine {
         // run off the edge.
         x = std::clamp(x, 0.0, std::max(0.0, static_cast<double>(win_w - natural_w)));
 
-        const double y = icon_baseline_y_ - icon.current_width - TOOLTIP_GAP - natural_h;
+        const double y = at_top()
+                             ? icon_baseline_y_ + icon.current_width + TOOLTIP_GAP
+                             : icon_baseline_y_ - icon.current_width - TOOLTIP_GAP - natural_h;
         gtk_fixed_move(GTK_FIXED(root_fixed_), tooltip_, x, std::max(0.0, y));
     }
 
@@ -828,7 +852,8 @@ class DockEngine {
             tallest = std::max(tallest, icon.current_width);
         }
 
-        const double top = icon_baseline_y_ - tallest - PANEL_PADDING_Y;
+        const double top = at_top() ? static_cast<double>(panel_bg_y_)
+                                    : icon_baseline_y_ - tallest - PANEL_PADDING_Y;
         // Downward it runs to the bottom of the window rather than the bottom
         // of the panel: the BOTTOM_MARGIN strip underneath is the screen edge,
         // and a dock you cannot hit by slamming the pointer into the bottom of
@@ -1237,10 +1262,10 @@ class DockEngine {
 
         if (progress < 0.5) {
             const double local = sine_in_out(progress * 2.0);
-            icon.bounce_offset = -BOUNCE_HEIGHT * local;
+            icon.bounce_offset = bounce_direction() * BOUNCE_HEIGHT * local;
         } else {
             const double local = sine_in_out((progress - 0.5) * 2.0);
-            icon.bounce_offset = -BOUNCE_HEIGHT * (1.0 - local);
+            icon.bounce_offset = bounce_direction() * BOUNCE_HEIGHT * (1.0 - local);
         }
 
         if (progress >= 1.0) {
@@ -1369,10 +1394,18 @@ class DockEngine {
             // relative to the icon baseline inside it, so magnified icons grow
             // up and out of the panel instead of the panel growing to contain
             // them.
-            panel_bg_y_ = win_h - panel_bg_height() - BOTTOM_MARGIN;
-            icon_baseline_y_ = panel_bg_y_ + PANEL_PADDING_Y + base_icon_px();
-            panel_y_ = icon_baseline_y_ -
-                       (PANEL_PADDING_Y + ITEM_SLOT_HEIGHT - ICON_BOTTOM_INSET);
+            if (at_top()) {
+                panel_bg_y_ = BOTTOM_MARGIN;
+                // Docked to the top, an icon's fixed edge is its top, and it
+                // grows downward. The baseline is that top edge.
+                icon_baseline_y_ = panel_bg_y_ + PANEL_PADDING_Y;
+                panel_y_ = icon_baseline_y_ - PANEL_PADDING_Y - ICON_BOTTOM_INSET;
+            } else {
+                panel_bg_y_ = win_h - panel_bg_height() - BOTTOM_MARGIN;
+                icon_baseline_y_ = panel_bg_y_ + PANEL_PADDING_Y + base_icon_px();
+                panel_y_ = icon_baseline_y_ -
+                           (PANEL_PADDING_Y + ITEM_SLOT_HEIGHT - ICON_BOTTOM_INSET);
+            }
 
             gtk_fixed_move(GTK_FIXED(root_fixed_), panel_bg_, panel_x_, static_cast<double>(panel_bg_y_));
             gtk_fixed_move(GTK_FIXED(root_fixed_), panel_fixed_, panel_x_, static_cast<double>(panel_y_));
@@ -1386,13 +1419,26 @@ class DockEngine {
                 g_print("window            : %d x %d\n", win_w, win_h);
                 g_print("panel (drawn)     : y %d .. %d   height %d\n",
                         panel_bg_y_, panel_bg_y_ + panel_bg_height(), panel_bg_height());
-                g_print("icon baseline     : y %d\n", icon_baseline_y_);
-                g_print("idle icon top     : y %d  (inside the panel)\n",
-                        icon_baseline_y_ - base_icon_px());
-                g_print("magnified top     : y %d  (%d px above the panel, scale %.2f)\n",
-                        icon_baseline_y_ - max_icon_px(),
-                        panel_bg_y_ - (icon_baseline_y_ - max_icon_px()),
-                        config_.max_scale);
+                // The baseline is the icon edge that does not move: its bottom
+                // when docked to the bottom, its top when docked to the top.
+                // Reporting it as though it were always the bottom printed
+                // negative coordinates for a dock that was laid out correctly.
+                const int idle_near = at_top() ? icon_baseline_y_
+                                               : icon_baseline_y_ - base_icon_px();
+                const int idle_far  = at_top() ? icon_baseline_y_ + base_icon_px()
+                                               : icon_baseline_y_;
+                const int mag_far   = at_top() ? icon_baseline_y_ + max_icon_px()
+                                               : icon_baseline_y_ - max_icon_px();
+                const int overhang  = at_top()
+                                          ? mag_far - (panel_bg_y_ + panel_bg_height())
+                                          : panel_bg_y_ - mag_far;
+                g_print("position          : %s\n", config_.position.c_str());
+                g_print("icon baseline     : y %d  (the %s edge of an icon)\n",
+                        icon_baseline_y_, at_top() ? "top" : "bottom");
+                g_print("idle icon         : y %d .. %d  (inside the panel)\n",
+                        idle_near, idle_far);
+                g_print("magnified reaches : y %d  (%d px %s the panel, scale %.2f)\n",
+                        mag_far, overhang, at_top() ? "below" : "above", config_.max_scale);
                 g_print("item row (no draw): y %d .. %d\n",
                         panel_y_, panel_y_ + panel_height);
                 g_print("screen-edge gap   : %d px\n", win_h - (panel_bg_y_ + panel_bg_height()));
@@ -1502,9 +1548,15 @@ class DockEngine {
         const int x = static_cast<int>(std::floor(panel_x_));
         const int width =
             static_cast<int>(std::ceil(panel_content_width_ + 2.0 * PANEL_PADDING_X)) + 1;
-        const int top = static_cast<int>(
-            std::floor(icon_baseline_y_ - tallest - PANEL_PADDING_Y));
-        const int height = std::max(gtk_widget_get_height(window_), SURFACE_HEIGHT) - top;
+        const int top = static_cast<int>(std::floor(
+            at_top() ? static_cast<double>(panel_bg_y_)
+                     : icon_baseline_y_ - tallest - PANEL_PADDING_Y));
+        // Docked to the top the region runs from the edge down past the
+        // tallest icon; docked to the bottom it runs from the tallest icon to
+        // the bottom of the surface.
+        const int height =
+            at_top() ? static_cast<int>(std::ceil(tallest + PANEL_PADDING_Y * 2)) + BOTTOM_MARGIN
+                     : std::max(gtk_widget_get_height(window_), SURFACE_HEIGHT) - top;
 
         const cairo_rectangle_int_t rect{x, std::max(0, top), width, std::max(1, height)};
         if (rect.x == last_input_region_.x && rect.y == last_input_region_.y &&
@@ -1520,10 +1572,11 @@ class DockEngine {
 
     void update_icon_internal_layout(IconRuntime& icon) {
         const int pixel_width = static_cast<int>(std::round(icon.current_width));
-        const double base_y = static_cast<double>(ITEM_SLOT_HEIGHT - pixel_width - ICON_BOTTOM_INSET);
+        const double base_y = icon_inset_y(pixel_width);
         const double image_y = std::max(0.0, base_y + icon.bounce_offset);
         const int dot_x = std::max(0, (pixel_width - DOT_SIZE) / 2);
-        const int dot_y = ITEM_SLOT_HEIGHT - 12;
+        // The running dot sits against the screen edge, so it swaps ends too.
+        const int dot_y = at_top() ? 8 : ITEM_SLOT_HEIGHT - 12;
 
         // Deliberately NOT a GskTransform. Measured on Iris Pro 5200 at 2x:
         // gtk_fixed_set_child_transform() per child per frame runs at 30 fps,
