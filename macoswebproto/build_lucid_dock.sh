@@ -8,6 +8,15 @@ cd "$(dirname "$0")"
 LOCAL_LIBDIR="$HOME/.local/lib/$(gcc -dumpmachine)"
 export PKG_CONFIG_PATH="$LOCAL_LIBDIR/pkgconfig:$HOME/.local/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
 
+# lucid-tokens is a submodule, pinned to a commit, so the schema and the dock
+# cannot drift apart the way they already did once -- two of fifteen keys were
+# configuring an easing the dock had deleted.
+if [ ! -f third_party/lucid-tokens/src/tokens.cpp ]; then
+    echo "Missing third_party/lucid-tokens. Run:" >&2
+    echo "  git submodule update --init --recursive" >&2
+    exit 1
+fi
+
 if ! pkg-config --exists gtk4; then
     echo "Missing GTK4 development files. Install: sudo apt install libgtk-4-dev" >&2
     exit 1
@@ -77,7 +86,9 @@ rm -f lucid_dock_cpp lucid_dock_settings
 
 echo "Building with gtk4-layer-shell-0 $(pkg-config --modversion gtk4-layer-shell-0)"
 g++ -std=c++20 -O2 -DHAVE_GTK4_LAYER_SHELL=1 -Igenerated -I. \
-    lucid_dock.cpp toplevel_source.cpp generated/build_stamp.cpp $proto_objs -o lucid_dock_cpp \
+    -Ithird_party/lucid-tokens/include \
+    lucid_dock.cpp toplevel_source.cpp generated/build_stamp.cpp \
+    third_party/lucid-tokens/src/tokens.cpp $proto_objs -o lucid_dock_cpp \
     $(pkg-config --cflags --libs gtk4-layer-shell-0 gtk4 gio-unix-2.0 wayland-client) \
     $rpath_flag ${LUCID_RPATH:+-Wl,-rpath,"$LUCID_RPATH"}
 echo "Built ./lucid_dock_cpp"

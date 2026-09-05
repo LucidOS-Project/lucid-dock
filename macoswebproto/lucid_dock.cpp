@@ -11,6 +11,7 @@
 
 #include "dock_config.h"
 #include "toplevel_source.h"
+#include "lucid/tokens.h"
 #include "build_stamp.h"
 
 #include <algorithm>
@@ -43,9 +44,9 @@ constexpr int MAX_ICON_SIZE = 80;
 constexpr double MIN_MAX_SCALE = 1.0;
 constexpr double MAX_MAX_SCALE = 3.0;
 
-constexpr int PANEL_PADDING_X = 10;
+int PANEL_PADDING_X = 10;         // dock.padding-x
 constexpr int PANEL_PADDING_Y = 8;
-constexpr int ITEM_GAP = 10;
+int ITEM_GAP = 10;                // dock.item-gap
 // The row of item slots is tall enough for a fully magnified icon. It is a
 // layout container only -- it draws nothing.
 constexpr int ITEM_SLOT_HEIGHT = 128;
@@ -55,6 +56,12 @@ constexpr int DOT_SIZE = 4;
 // one thing in the vertical layout that never moves.
 constexpr int ICON_BOTTOM_INSET = 13;
 constexpr int BOTTOM_MARGIN = 8;
+// dock.corner-radius and dock.background-opacity. Not constants for long: they
+// are written into the stylesheet at run time by install_css().
+double PANEL_CORNER_RADIUS = 19.0;
+double PANEL_BACKGROUND_OPACITY = 0.4;
+
+
 
 constexpr int icon_px_for(double icon_size) { return static_cast<int>(icon_size + 0.5); }
 constexpr int panel_bg_height_for(int icon_px) {
@@ -153,8 +160,36 @@ constexpr double SPRING_ZETA = 0.783;   // damping ratio, < 1 so it settles by
 constexpr double ENVELOPE_SETTLE = 0.001;
 constexpr double ENVELOPE_SETTLE_VELOCITY = 0.02;
 
-constexpr double BOUNCE_HEIGHT = 40.0;
-constexpr double BOUNCE_DURATION = 0.4;
+double BOUNCE_HEIGHT = 40.0;      // dock.bounce-height
+double BOUNCE_DURATION = 0.4;     // dock.bounce-duration
+
+// Values above that come from lucid-tokens rather than from this file.
+//
+// Every initialiser here is the compiled-in default and must equal the default
+// in lucid-tokens' schema, so a machine with no configuration at all renders
+// exactly what it did before any of this existed. Verified: the schema's
+// defaults were checked key by key against these before they were wired.
+//
+// Deliberately NOT token-backed yet: PANEL_PADDING_Y, BOTTOM_MARGIN and
+// DOT_SIZE. All three feed panel_bg_height_for(), which feeds the constexpr
+// SURFACE_HEIGHT, and that constant is load-bearing -- sizing the surface to
+// the current configuration is what used to make the dock walk down the screen
+// every time magnification was raised.
+//
+// They could be run-time if SURFACE_HEIGHT were computed from each key's
+// schema *maximum* rather than its current value, which is exactly the
+// existing rule for icon size and magnification. That is worth doing and it is
+// not free: dock.indicator-size allows up to 24, so the surface would grow by
+// 20 px whether or not anyone uses it. A separate change, with the geometry
+// re-measured.
+void load_tokens(const lucid::Config& cfg) {
+    PANEL_PADDING_X = static_cast<int>(cfg.get_double("dock.padding-x"));
+    ITEM_GAP = static_cast<int>(cfg.get_double("dock.item-gap"));
+    BOUNCE_HEIGHT = cfg.get_double("dock.bounce-height");
+    BOUNCE_DURATION = cfg.get_double("dock.bounce-duration");
+    PANEL_CORNER_RADIUS = cfg.get_double("dock.corner-radius");
+    PANEL_BACKGROUND_OPACITY = cfg.get_double("dock.background-opacity");
+}
 
 // The dock slides in from off-screen when it starts, the way the macOS dock is
 // revealed. 300 ms because that is the reference's own figure for the same
@@ -2748,42 +2783,36 @@ window {
     background-color: rgba(20, 20, 20, 0.30);
 }
 
-/* The 1px dark ring is load-bearing, not decoration: the panel is 40% white,
-   so over a white application it is very nearly invisible and the ring is what
-   still says where the dock is. Do not remove it to "clean up" the edge.
-
-   The drop shadow had a 7px spread, and spread is not blur -- it inflates the
-   shadow rectangle by 7px at the full 30% black *before* any blurring. That was
-   worth removing, but it was not what made the shadow look blocky.
-
-   What makes it look blocky is that the shadow is CLIPPED. Nothing renders
-   outside the surface, the panel's bottom edge sits BOTTOM_MARGIN (8px) above
-   the surface's, and a shadow needs roughly 30px to fade out -- so the bottom
-   of it is cut off flat, straight across the full width of the dock. A shadow
-   that stops abruptly is a rectangle, however soft its blur is.
-
-   So the vertical offset has to go. Offsetting the shadow downwards aims its
-   darkest part at the one direction with no room. With no offset at all the
-   grey level 8px below the panel -- the last row before the cut -- goes from 49
-   levels darker than the background to 5, which is under the threshold where
-   the cut is perceptible, while the shadow at the panel's sides is unchanged
-   (233 -> 234). Measured by rendering this stylesheet through GSK itself; see
-   tools/render_panel.c, because a model of what CSS says is not what GTK draws
-   and reasoning from the former is what shipped the first attempt at this. */
-.dock-panel {
-    background: rgba(255, 255, 255, 0.4);
-    border-radius: 19px;
-    box-shadow:
-        inset 0 0 0 1px rgba(255, 255, 255, 0.28),
-        0 0 0 1px rgba(20, 20, 20, 0.22),
-        0 0 6px rgba(0, 0, 0, 0.22),
-        0 0 14px rgba(0, 0, 0, 0.18);
-}
 )CSS";
 
 
+        // The panel's own rule is generated, because two of its values are
+        // settings rather than constants. This is the whole point of the token
+        // model in one place: a number stops being a literal buried in a
+        // stylesheet and becomes a key the desktop can list, document,
+        // validate, revert, and say where it came from.
+        //
+        // The 1px dark ring is load-bearing and is not a setting: the panel is
+        // 40% white, so over a white application it is nearly invisible and the
+        // ring is the only thing still saying where the dock is. The shadow has
+        // no vertical offset because the surface clips it -- see the README.
+        gchar* panel_rule = g_strdup_printf(
+            ".dock-panel {\n"
+            "    background: rgba(255, 255, 255, %.4f);\n"
+            "    border-radius: %.2fpx;\n"
+            "    box-shadow:\n"
+            "        inset 0 0 0 1px rgba(255, 255, 255, 0.28),\n"
+            "        0 0 0 1px rgba(20, 20, 20, 0.22),\n"
+            "        0 0 6px rgba(0, 0, 0, 0.22),\n"
+            "        0 0 14px rgba(0, 0, 0, 0.18);\n"
+            "}\n",
+            PANEL_BACKGROUND_OPACITY, PANEL_CORNER_RADIUS);
+        gchar* full_css = g_strconcat(kCss, panel_rule, nullptr);
+
         GtkCssProvider* provider = gtk_css_provider_new();
-        gtk_css_provider_load_from_string(provider, kCss);
+        gtk_css_provider_load_from_string(provider, full_css);
+        g_free(panel_rule);
+        g_free(full_css);
 
         GdkDisplay* display = gdk_display_get_default();
         if (display != nullptr) {
@@ -2893,8 +2922,35 @@ window {
     cairo_rectangle_int_t last_input_region_{-1, -1, -1, -1};
 };
 
+// Printed when anything is not at its default, and whenever loading had
+// something to say. Provenance is the entire point of the model, so a dock that
+// used it silently would be wasting it -- "why is my dock like this" should be
+// answerable from the log rather than by hunting through files.
+void report_tokens(const lucid::Config& cfg) {
+    for (const auto& [key, resolved] : cfg.changed()) {
+        g_message("token: %-28s %-10s [%s] %s", key.c_str(),
+                  lucid::to_string(resolved.value).c_str(),
+                  lucid::layer_name(resolved.layer), resolved.source_file.c_str());
+    }
+    // Never fatal by design: a malformed config must not cost a session. That
+    // is exactly why it has to be said out loud, or a clamped value looks like
+    // the dock ignoring you.
+    for (const auto& d : cfg.diagnostics()) {
+        g_warning("token: %s in %s: %s -- %s", d.key.c_str(), d.file.c_str(),
+                  d.problem.c_str(), d.action.c_str());
+    }
+}
+
 void on_activate(GtkApplication* app, gpointer) {
     static DockEngine engine;
+
+    // Tokens first: they carry values the stylesheet and the layout are built
+    // from, so nothing may read them before they are resolved.
+    static lucid::Config tokens(lucid::default_schema());
+    tokens.load(lucid::default_user_dir(), lucid::default_distro_dir());
+    load_tokens(tokens);
+    report_tokens(tokens);
+
     engine.start_toplevel_source();
     const auto catalog = load_desktop_catalog();
     const DockConfig config = ensure_config(catalog);

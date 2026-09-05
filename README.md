@@ -13,6 +13,7 @@ LucidOS desktop is built around (see "Why out-of-process" below).
 | `macoswebproto/dock_config.h` | Config + `.desktop` catalogue, shared by both binaries |
 | `macoswebproto/toplevel_source.{h,cpp}` | Which applications are running, and where that answer comes from |
 | `macoswebproto/protocols/` | Vendored Wayland protocol XML (the two foreign-toplevel protocols) |
+| `macoswebproto/third_party/lucid-tokens` | Submodule: the LucidOS configuration model |
 | `macoswebproto/tests/` | A fake compositor for the protocol no compositor here implements |
 | `macoswebproto/tools/render_panel.c` | Renders the panel through GSK to a PNG, for measuring what GTK actually draws |
 | `.github/workflows/ci.yml` | Builds both ways, runs the protocol tests and the memory budget |
@@ -28,6 +29,7 @@ LucidOS desktop is built around (see "Why out-of-process" below).
 
 ## Building
 
+    git submodule update --init --recursive
     cd macoswebproto
     cmake -S . -B build && cmake --build build
     ./build/lucid_dock_cpp
@@ -352,6 +354,75 @@ This is a stand-in for running against a real compositor, not a replacement for
 it. It proves the client speaks the protocol correctly; it cannot prove a real
 compositor sends what this one sends. Re-run the `wlr` scenario against a real
 `ext` compositor once one is available on the host.
+
+## Settings come from two places, and that is on purpose
+
+**Tokens** are values with a default, a range, and a meaningful revert:
+spacing, radii, opacities, animation figures. They live in
+[lucid-tokens](https://github.com/LucidOS-Project/lucid-tokens), a layered
+resolver where every value remembers which layer set it, and they are read
+through the submodule in `third_party/`.
+
+**`dock.conf`** keeps what is not a token: the pinned list, the dividers, the
+icon theme, the renderer. An arrangement has no default and no sensible
+"reset" -- the dock's own Reset to Defaults deliberately does not touch the
+pinned list, because discarding someone's arrangement to get the sliders back
+is a bad trade. A thing you can reset and a thing you cannot are different
+kinds of setting and they are stored differently.
+
+### What the dock reads from tokens
+
+| Token | Was |
+|---|---|
+| `dock.padding-x` | `PANEL_PADDING_X` |
+| `dock.item-gap` | `ITEM_GAP` |
+| `dock.bounce-height` | `BOUNCE_HEIGHT` |
+| `dock.bounce-duration` | `BOUNCE_DURATION` |
+| `dock.corner-radius` | a literal in the stylesheet |
+| `dock.background-opacity` | a literal in the stylesheet |
+
+The last two matter most, because they show what the model is *for*: the
+`.dock-panel` rule is now generated at run time, so a number that was buried in
+a CSS string is a key the desktop can list, document, validate, revert, and
+attribute. Verified byte-identical: the generated stylesheet and the old
+hardcoded one render to the same PNG through GSK, and rendering again with
+`dock.corner-radius` at 4 produces a different one -- so the wiring changed
+nothing and the token does something.
+
+**Not wired yet, and the reason is specific.** `PANEL_PADDING_Y`,
+`BOTTOM_MARGIN` and `DOT_SIZE` all feed `panel_bg_height_for()`, which feeds the
+`constexpr SURFACE_HEIGHT`, and that constant is load-bearing -- sizing the
+surface to the current configuration is what used to make the dock walk down
+the screen every time magnification was raised. They can become settings when
+`SURFACE_HEIGHT` is computed from each key's schema *maximum* rather than its
+current value, which is already the rule for icon size and magnification. Not
+free: `dock.indicator-size` allows up to 24, so the surface would grow 20 px
+whether or not anyone uses it. A separate change, with the geometry re-measured.
+
+Also not yet moved: `IconSize`, `MaxScale` and `Spread` still come from
+`dock.conf` although the schema defines them, so those three have two possible
+homes until the migration lands.
+
+### The safety claim, in the running dock
+
+Feed it a broken user layer:
+
+    [dock]
+    corner-radius = banana
+    item-gap = 9999
+    not-a-key = 3
+
+and the dock starts, with all three reported:
+
+    token: dock.corner-radius ... value 'banana' is not a double -- using 19
+    token: dock.item-gap ... value 9999 out of range -- clamped to 64
+    token: dock.not-a-key ... unknown key -- ignored, file left unchanged
+
+Resolution never fails, and the unknown key is *carried* rather than dropped,
+so a config written by a newer LucidOS cannot break an older one. Anything not
+at its default is printed at startup with its layer and its file, because
+provenance that nothing surfaces is provenance wasted -- "why is my dock like
+this" should be answerable from the log rather than by hunting through files.
 
 ## Configuration
 

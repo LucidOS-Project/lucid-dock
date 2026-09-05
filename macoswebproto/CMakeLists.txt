@@ -94,10 +94,19 @@ else()
 	pkg_check_modules(GTK4_LAYER_SHELL REQUIRED IMPORTED_TARGET gtk4-layer-shell-0)
 endif()
 
+# lucid-tokens is a submodule pinned to a commit, so the schema and the dock
+# cannot drift apart the way they already did once.
+set(LUCID_TOKENS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/lucid-tokens")
+if(NOT EXISTS "${LUCID_TOKENS_DIR}/src/tokens.cpp")
+	message(FATAL_ERROR
+		"Missing ${LUCID_TOKENS_DIR}. Run: git submodule update --init --recursive")
+endif()
+
 add_executable(lucid_dock_cpp lucid_dock.cpp toplevel_source.cpp "${LUCID_STAMP_CPP}"
+	"${LUCID_TOKENS_DIR}/src/tokens.cpp"
 	${LUCID_PROTOCOL_SOURCES})
 target_include_directories(lucid_dock_cpp PRIVATE "${LUCID_PROTOCOL_DIR}"
-	"${CMAKE_CURRENT_SOURCE_DIR}")
+	"${CMAKE_CURRENT_SOURCE_DIR}" "${LUCID_TOKENS_DIR}/include")
 add_dependencies(lucid_dock_cpp lucid_build_stamp)
 
 # gtk4-layer-shell has to precede libwayland on the link line -- it works by

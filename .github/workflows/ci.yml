@@ -11,6 +11,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       # sway gives the tests a real layer-shell compositor with a headless
       # backend, so they run the anchored path rather than the unanchored
@@ -60,6 +62,13 @@ jobs:
           cmake -S . -B build/ci
           cmake --build build/ci
           ./build/ci/lucid_dock_cpp --version
+
+      # lucid-tokens has its own suite, including a 400-file fuzz asserting that
+      # no input can make resolution fail. The dock depends on that invariant,
+      # so it is checked here rather than assumed.
+      - name: lucid-tokens tests
+        working-directory: macoswebproto/third_party/lucid-tokens
+        run: make check
 
       - name: Foreign-toplevel protocol tests
         working-directory: macoswebproto

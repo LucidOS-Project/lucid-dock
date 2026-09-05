@@ -241,13 +241,25 @@ EOF
 output HEADLESS-1 resolution 1920x323
 exec_always env XDG_CONFIG_HOME=$WORK/config XDG_DATA_HOME=$WORK/data XDG_DATA_DIRS=$WORK/data:/usr/share GSK_RENDERER=cairo LUCID_DOCK_RUNNING=1 $binary > $WORK/$procname.log 2>&1
 EOF
+    # Which processes with this name already existed. Taking the first match
+    # measured a dock left running by an earlier test once and reported 51.1 MiB
+    # against a real 20.0 -- the check's own failure mode, measuring something
+    # that is not the thing under test.
+    local before
+    before=$(pgrep -x "$procname" | tr '\n' ' ')
+
     WLR_BACKENDS=headless sway -c "$WORK/sway.cfg" > "$WORK/sway.log" 2>&1 &
     SWAY_PID=$!
 
     local pid="" waited=0
     while [ -z "$pid" ] && [ "$waited" -lt 30 ]; do
         sleep 1; waited=$((waited + 1))
-        pid=$(pgrep -x "$procname" | head -1)
+        for candidate in $(pgrep -x "$procname"); do
+            case " $before " in
+                *" $candidate "*) ;;            # was already running: not ours
+                *) pid=$candidate; break ;;
+            esac
+        done
     done
     if [ -z "$pid" ]; then
         echo "FAIL: $procname never started under headless sway" >&2
