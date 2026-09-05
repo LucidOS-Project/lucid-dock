@@ -111,17 +111,56 @@ measure() {
     # byte the same as an empty window -- 17.4 MiB against 17.4 MiB. Icon
     # rasterisation is most of what the dock's own memory is, so a dock with no
     # icons is not a smaller dock, it is a different program.
-    mkdir -p "$WORK/config/lucid" "$WORK/data/applications"
+    local themedir="$WORK/data/icons/lucidmemtest/256x256/apps"
+    mkdir -p "$WORK/config/lucid" "$WORK/data/applications" "$themedir"
+
+    # The fixture ships its own icons rather than naming stock ones.
+    #
+    # Naming stock icons was tried and is why CI and this machine disagreed by
+    # an order of magnitude: the dock resolves whatever icon theme the session
+    # is set to, CI got Adwaita's lightweight symbolic SVGs and a development
+    # machine got ZorinBlue's full-colour PNGs, and rasterising those is most of
+    # what is being measured. Same code, same fixture, 8.5 MiB against 0.7.
+    #
+    # Written with nothing but the Python standard library, so the bytes are
+    # identical on every machine and no image tooling has to be installed.
+    python3 - "$themedir" <<'PYICON'
+import struct, sys, zlib
+W = H = 256
+# Deterministic non-uniform pixels: a flat colour would let a decoder or a
+# texture cache collapse it into something unrepresentative of a real icon.
+rows = b"".join(
+    b"\x00" + bytes(v for x in range(W) for v in (x & 255, y & 255, (x ^ y) & 255, 255))
+    for y in range(H)
+)
+def chunk(tag, data):
+    return (struct.pack(">I", len(data)) + tag + data
+            + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+png = (b"\x89PNG\r\n\x1a\n"
+       + chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 6, 0, 0, 0))
+       + chunk(b"IDAT", zlib.compress(rows, 6))
+       + chunk(b"IEND", b""))
+for i in range(1, 9):
+    open(f"{sys.argv[1]}/lucid-memtest-{i}.png", "wb").write(png)
+PYICON
+    cat > "$WORK/data/icons/lucidmemtest/index.theme" <<EOF
+[Icon Theme]
+Name=lucidmemtest
+Directories=256x256/apps
+
+[256x256/apps]
+Size=256
+Type=Fixed
+EOF
+
     local pinned="" i=0
-    for icon in folder text-x-generic image-x-generic audio-x-generic \
-                video-x-generic application-x-executable font-x-generic package-x-generic; do
-        i=$((i + 1))
+    for i in 1 2 3 4 5 6 7 8; do
         cat > "$WORK/data/applications/lucid-memtest-$i.desktop" <<EOF
 [Desktop Entry]
 Type=Application
 Name=Mem Test $i
 Exec=/bin/true
-Icon=$icon
+Icon=lucid-memtest-$i
 EOF
         pinned="$pinned lucid-memtest-$i.desktop;"
     done
@@ -131,6 +170,7 @@ Pinned=$(echo "$pinned" | tr -d ' ')
 DividersBefore=
 Magnification=true
 ShowRunning=false
+IconTheme=lucidmemtest
 MaxScale=2
 Spread=6
 IconSize=0
