@@ -25,6 +25,7 @@ struct fake_toplevel {
     struct wl_list link;        // in `toplevels`
     struct wl_list handles;     // wl_resource links
     char *app_id;
+    char *title;
     char *identifier;
     int id;
 };
@@ -62,6 +63,7 @@ static void send_toplevel_to(struct wl_resource *list_resource, struct fake_topl
 
     ext_foreign_toplevel_list_v1_send_toplevel(list_resource, handle);
     ext_foreign_toplevel_handle_v1_send_identifier(handle, toplevel->identifier);
+    ext_foreign_toplevel_handle_v1_send_title(handle, toplevel->title);
     ext_foreign_toplevel_handle_v1_send_app_id(handle, toplevel->app_id);
     ext_foreign_toplevel_handle_v1_send_done(handle);
 }
@@ -108,9 +110,11 @@ static void list_bind(struct wl_client *client, void *data, uint32_t version, ui
 
 // --- the script -------------------------------------------------------------
 
-static struct fake_toplevel *add_toplevel(const char *app_id, const char *identifier) {
+static struct fake_toplevel *add_toplevel(const char *app_id, const char *title,
+                                          const char *identifier) {
     struct fake_toplevel *toplevel = calloc(1, sizeof(*toplevel));
     toplevel->app_id = strdup(app_id);
+    toplevel->title = strdup(title);
     toplevel->identifier = strdup(identifier);
     wl_list_init(&toplevel->handles);
     wl_list_insert(toplevels.prev, &toplevel->link);
@@ -162,18 +166,36 @@ static void rename_toplevel(const char *identifier, const char *app_id) {
     fprintf(stderr, "[fake] ~ toplevel %s is now %s\n", identifier, app_id);
 }
 
+// A title change and nothing else: what a browser does on every navigation.
+// The key set must not move for this, and the window list must.
+static void retitle_toplevel(const char *identifier, const char *title) {
+    struct fake_toplevel *toplevel = find_toplevel(identifier);
+    if (toplevel == NULL) {
+        return;
+    }
+    free(toplevel->title);
+    toplevel->title = strdup(title);
+    struct wl_resource *handle;
+    wl_list_for_each(handle, &toplevel->handles, link) {
+        ext_foreign_toplevel_handle_v1_send_title(handle, title);
+        ext_foreign_toplevel_handle_v1_send_done(handle);
+    }
+    fprintf(stderr, "[fake] ~ toplevel %s retitled \"%s\"\n", identifier, title);
+}
+
 static struct wl_event_source *script_timer;
 
 static int advance(void *data) {
     (void)data;
 
     switch (step++) {
-        case 0: add_toplevel("firefox", "b"); break;
-        case 1: add_toplevel("firefox", "c"); break;         // second window, same app_id
-        case 2: close_toplevel("b"); break;                  // one of two: key must survive
-        case 3: close_toplevel("c"); break;                  // last one: key must go
-        case 4: rename_toplevel("a", "org.gnome.Console"); break;
-        case 5: close_toplevel("a"); break;
+        case 0: add_toplevel("firefox", "Wikipedia", "b"); break;
+        case 1: add_toplevel("firefox", "Hacker News", "c"); break;   // 2nd window, same app_id
+        case 2: retitle_toplevel("c", "Lobsters"); break;             // list moves, keys do not
+        case 3: close_toplevel("b"); break;                  // one of two: key must survive
+        case 4: close_toplevel("c"); break;                  // last one: key must go
+        case 5: rename_toplevel("a", "org.gnome.Console"); break;
+        case 6: close_toplevel("a"); break;
         default:
             fprintf(stderr, "[fake] script finished\n");
             wl_display_terminate(display);
@@ -204,7 +226,7 @@ int main(int argc, char **argv) {
 
     // One toplevel is already open before the client connects, so the initial
     // enumeration path is exercised and not just the incremental one.
-    add_toplevel("org.gnome.TextEditor", "a");
+    add_toplevel("org.gnome.TextEditor", "Untitled Document", "a");
 
     // One timer, re-armed by its own callback. It is kept in a file static
     // because the callback has to re-arm the source it is running on, and that

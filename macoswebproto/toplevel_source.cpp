@@ -70,7 +70,14 @@ class ProcToplevelSource final : public ToplevelSource {
   public:
     ToplevelSourceKind kind() const override { return ToplevelSourceKind::Proc; }
     bool is_event_driven() const override { return false; }
+    bool reports_windows() const override { return false; }
     const std::unordered_set<std::string>& running_keys() const override { return keys_; }
+
+    // A process is not a window and /proc cannot be made to say otherwise.
+    const std::vector<ToplevelInfo>& toplevels() const override {
+        static const std::vector<ToplevelInfo> kNone;
+        return kNone;
+    }
 
     void refresh() override {
         std::unordered_set<std::string> names;
@@ -167,7 +174,9 @@ class WaylandToplevelSource : public ToplevelSource {
     }
 
     bool is_event_driven() const override { return true; }
+    bool reports_windows() const override { return true; }
     const std::unordered_set<std::string>& running_keys() const override { return keys_; }
+    const std::vector<ToplevelInfo>& toplevels() const override { return toplevels_; }
     void refresh() override {}   // already current: that is the entire point
 
     // A separate connection to the compositor rather than GTK's own. The
@@ -216,8 +225,14 @@ class WaylandToplevelSource : public ToplevelSource {
     // observed mid-change.
     struct HandleState {
         WaylandToplevelSource* owner = nullptr;
+        // Everything the protocols double-buffer: pending until `done` commits
+        // it, so a toplevel is never observed halfway through a change.
         std::string pending_app_id;
+        std::string pending_title;
         std::string committed_app_id;
+        std::string committed_title;
+        // Sent once and never changed, so it needs no pending half.
+        std::string identifier;
         bool committed = false;
     };
 
@@ -235,16 +250,39 @@ class WaylandToplevelSource : public ToplevelSource {
         state->pending_app_id = app_id != nullptr ? normalise_match_key(app_id) : std::string();
     }
 
+    void handle_title(HandleState* state, const char* title) {
+        state->pending_title = title != nullptr ? title : "";
+    }
+
+    void handle_identifier(HandleState* state, const char* identifier) {
+        state->identifier = identifier != nullptr ? identifier : "";
+    }
+
     void handle_done(HandleState* state) {
-        if (state->committed && state->committed_app_id == state->pending_app_id) {
+        const bool app_id_changed =
+            !state->committed || state->committed_app_id != state->pending_app_id;
+        const bool title_changed =
+            !state->committed || state->committed_title != state->pending_title;
+        if (!app_id_changed && !title_changed) {
             return;
         }
-        if (state->committed) {
-            release_key(state->committed_app_id);
+
+        // Only the app_id participates in the key set, so only it moves the
+        // reference counts. A title change republishes the window list without
+        // touching them -- and without setting dirty_, so the dock is not
+        // rebuilt every time a browser navigates.
+        if (app_id_changed) {
+            if (state->committed) {
+                release_key(state->committed_app_id);
+            }
+            state->committed_app_id = state->pending_app_id;
         }
-        state->committed_app_id = state->pending_app_id;
+        state->committed_title = state->pending_title;
         state->committed = true;
-        acquire_key(state->committed_app_id);
+        if (app_id_changed) {
+            acquire_key(state->committed_app_id);
+        }
+        republish_toplevels();
     }
 
     void handle_closed(HandleState* state) {
@@ -266,18 +304,46 @@ class WaylandToplevelSource : public ToplevelSource {
         }
         keys_.clear();
         counts_.clear();
+        handles_.clear();
+        toplevels_.clear();
     }
 
   protected:
+    // A vector rather than a map, so the published list keeps the order the
+    // compositor announced windows in -- oldest first, which is the order a
+    // taskbar would lay buttons out in and the one thing a hash container
+    // cannot promise. There are as many entries as there are open windows, so
+    // the linear erase below is not worth avoiding.
     HandleState* new_handle_state() {
-        auto state = std::make_unique<HandleState>();
-        state->owner = this;
-        HandleState* raw = state.get();
-        handles_[raw] = std::move(state);
-        return raw;
+        handles_.push_back(std::make_unique<HandleState>());
+        handles_.back()->owner = this;
+        return handles_.back().get();
     }
 
-    void drop_handle_state(HandleState* state) { handles_.erase(state); }
+    void drop_handle_state(HandleState* state) {
+        const auto it = std::find_if(
+            handles_.begin(), handles_.end(),
+            [state](const std::unique_ptr<HandleState>& held) { return held.get() == state; });
+        if (it != handles_.end()) {
+            handles_.erase(it);
+        }
+        republish_toplevels();
+    }
+
+    // Rebuilt whole rather than patched. The list is one entry per open window,
+    // so this is a handful of small strings, and a rebuild cannot drift out of
+    // step with the handles the way incremental edits can.
+    void republish_toplevels() {
+        toplevels_.clear();
+        toplevels_.reserve(handles_.size());
+        for (const std::unique_ptr<HandleState>& held : handles_) {
+            if (!held->committed) {
+                continue;   // announced but not yet committed by `done`
+            }
+            toplevels_.push_back(ToplevelInfo{held->committed_app_id, held->committed_title,
+                                              held->identifier});
+        }
+    }
 
   private:
     void acquire_key(const std::string& key) {
@@ -371,7 +437,8 @@ class WaylandToplevelSource : public ToplevelSource {
     }
 
     ChangedCallback on_changed_;
-    std::unordered_map<HandleState*, std::unique_ptr<HandleState>> handles_;
+    std::vector<std::unique_ptr<HandleState>> handles_;
+    std::vector<ToplevelInfo> toplevels_;
     std::unordered_map<std::string, int> counts_;
     std::unordered_set<std::string> keys_;
     bool dirty_ = false;
@@ -448,14 +515,21 @@ class ExtToplevelSource final : public WaylandToplevelSource {
         state->owner->handle_done(state);
     }
 
-    static void on_title(void*, ext_foreign_toplevel_handle_v1*, const char*) {}
+    static void on_title(void* data, ext_foreign_toplevel_handle_v1*, const char* title) {
+        auto* state = static_cast<HandleState*>(data);
+        state->owner->handle_title(state, title);
+    }
 
     static void on_app_id(void* data, ext_foreign_toplevel_handle_v1*, const char* app_id) {
         auto* state = static_cast<HandleState*>(data);
         state->owner->handle_app_id(state, app_id);
     }
 
-    static void on_identifier(void*, ext_foreign_toplevel_handle_v1*, const char*) {}
+    static void on_identifier(void* data, ext_foreign_toplevel_handle_v1*,
+                              const char* identifier) {
+        auto* state = static_cast<HandleState*>(data);
+        state->owner->handle_identifier(state, identifier);
+    }
 
     ext_foreign_toplevel_list_v1* list_ = nullptr;
 };
@@ -516,7 +590,14 @@ class WlrToplevelSource final : public WaylandToplevelSource {
         static_cast<WlrToplevelSource*>(data)->handle_finished();
     }
 
-    static void on_title(void*, zwlr_foreign_toplevel_handle_v1*, const char*) {}
+    // No identifier in this protocol -- it is one of the things
+    // ext-foreign-toplevel-list-v1 added -- so ToplevelInfo::identifier stays
+    // empty here. A consumer that needs stable window identity across handles
+    // cannot get it from wlr.
+    static void on_title(void* data, zwlr_foreign_toplevel_handle_v1*, const char* title) {
+        auto* state = static_cast<HandleState*>(data);
+        state->owner->handle_title(state, title);
+    }
 
     static void on_app_id(void* data, zwlr_foreign_toplevel_handle_v1*, const char* app_id) {
         auto* state = static_cast<HandleState*>(data);

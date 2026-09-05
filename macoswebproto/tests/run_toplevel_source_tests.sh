@@ -73,11 +73,19 @@ if ! head -1 "$build/probe.log" | grep -qx "source: ext"; then
 fi
 sed -n '2,$p' "$build/probe.log"
 
+# Every window-list sample, for eyeballing when something fails.
+echo "--- window list over time ---"
+grep -E '^(initial|t\+[0-9.]+s) windows:' "$build/probe.log"
+
 # Expected sequence. Each line is the complete key set after one change, so a
 # missing event and a spurious one both show up as a diff rather than as a
 # grep that happens to still pass.
+# Only the key-set lines and the final window list: the periodic samples in
+# between are timing-dependent and would make this a flaky test rather than a
+# stricter one. The samples are still printed, and shown above on failure.
 cat > "$build/expected" <<'EXPECTED'
 source: ext
+reports windows: yes
 initial: [org.gnome.texteditor]
 changed: [firefox org.gnome.texteditor]
 changed: [org.gnome.texteditor]
@@ -86,10 +94,44 @@ changed: []
 EXPECTED
 
 echo "--- diff (expected vs actual) ---"
-if diff -u "$build/expected" "$build/probe.log"; then
-    echo "PASS"
-else
-    echo "FAIL" >&2
+if ! diff -u "$build/expected" <(grep -vE '^(initial|t\+[0-9.]+s) windows:' "$build/probe.log"); then
+    echo "FAIL: key-set sequence" >&2
     cat "$build/probe.err" >&2
     exit 1
 fi
+
+# The window list is what the key set cannot tell you. Two windows of one
+# application are one key and two entries, a retitle moves the list and not the
+# keys, and the order is the order the compositor announced them in.
+# Asserted on content, never on which sample it landed in: the fake's script
+# steps every 700 ms and the probe samples every 500 ms, so the two drift and
+# pinning a state to a timestamp is a flaky test rather than a stricter one.
+# Whole-line matching after the prefix is stripped, so a two-window list cannot
+# pass by being a prefix of a three-window one.
+sed -nE 's/^(initial|t\+[0-9.]+s) windows: ?//p' "$build/probe.log" > "$build/samples"
+
+check() {
+    if ! grep -qxF "$2" "$build/samples"; then
+        echo "FAIL: no window-list sample ever equalled:" >&2
+        echo "  $2" >&2
+        echo "($1)" >&2
+        echo "what was actually seen:" >&2
+        sort -u "$build/samples" | sed 's/^/  /' >&2
+        exit 1
+    fi
+    echo "  ok: $1"
+}
+echo "--- window list assertions ---"
+check "initial enumeration carries title and identifier" \
+      "{org.gnome.texteditor|Untitled Document|a}"
+check "two windows of one app are two entries, oldest first" \
+      "{org.gnome.texteditor|Untitled Document|a} {firefox|Wikipedia|b} {firefox|Hacker News|c}"
+check "a retitle moves the window list, and only that window" \
+      "{org.gnome.texteditor|Untitled Document|a} {firefox|Wikipedia|b} {firefox|Lobsters|c}"
+check "closing one of two leaves the other, in place" \
+      "{org.gnome.texteditor|Untitled Document|a} {firefox|Lobsters|c}"
+check "an app_id change keeps the window and its title" \
+      "{org.gnome.console|Untitled Document|a}"
+check "everything closed empties the list" \
+      ""
+echo "PASS"

@@ -233,6 +233,33 @@ key between them, so opening a second Firefox window, or closing one of two,
 produces no dock work at all -- and, more importantly, does not put the dot out
 while a window is still open.
 
+### One key per application, one entry per window
+
+`running_keys()` answers "is anything with this app_id open", which is the
+question a dot under an icon asks. `toplevels()` is the same information before
+it has been reduced to that: one `ToplevelInfo` per open window, carrying the
+app_id, the title, and -- under `ext` only -- the stable identifier. Two windows
+of one application are one key and two entries.
+
+The list is in the order the compositor announced windows, oldest first, which
+is the order a taskbar would lay buttons out in and the one property a hash
+container cannot promise. It is empty under `proc`, which has no window
+information at all -- ask `reports_windows()` rather than testing it for
+emptiness, because "no windows" and "cannot see windows" are different answers.
+
+This exists because the compositor already sends a title and an identifier with
+every toplevel and the dock was receiving both and dropping them on the floor.
+Keeping them is not building a taskbar; it is declining to destroy information
+we are handed, which is far cheaper now than adding the path for it later.
+
+**The change callback still fires only on key-set changes.** A second window of
+a running application does not move the key set, and neither does a retitle --
+and the dock must not rebuild for either, or a browser would rebuild it on every
+page it navigated to. Verified: opening a second window of an already-running
+application produces no callback at all. A per-window consumer needs a signal
+this one does not give and should add one rather than widening this, which
+exists to keep the dock still.
+
 ### Matching a window to a desktop file
 
 `app_id` and desktop file id are related by convention, not by rule. The
@@ -311,9 +338,13 @@ rendering -- and plays a fixed script of toplevels at the dock's real
     ./macoswebproto/tests/run_toplevel_source_tests.sh
 
 It covers initial enumeration on bind, a toplevel appearing later, two
-toplevels sharing an `app_id`, an `app_id` changed and committed with `done`,
-and `closed`. It asserts the whole sequence of states rather than grepping for
-individual events, so a missing event and a spurious one both fail.
+toplevels sharing an `app_id`, a retitle, an `app_id` changed and committed with
+`done`, and `closed`. It asserts the whole sequence of key sets rather than
+grepping for individual events, so a missing event and a spurious one both fail,
+and it asserts the window list separately -- on content rather than on which
+sample it landed in, since the fake's script and the probe's sampling drift
+against each other and pinning a state to a timestamp would be a flaky test
+rather than a stricter one.
 
 This is a stand-in for running against a real compositor, not a replacement for
 it. It proves the client speaks the protocol correctly; it cannot prove a real
