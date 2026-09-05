@@ -85,6 +85,19 @@ constexpr int DIVIDER_SLOT = DIVIDER_WIDTH + DIVIDER_MARGIN * 2;
 constexpr int TOOLTIP_GAP = 10;         // icon top to label bottom
 constexpr int TOOLTIP_RESERVE = 36;     // headroom to reserve for it
 
+// Appearing is instant; leaving is not. A label that has been up for a few
+// seconds has already been read, and holding it there for as long as the
+// pointer happens to rest on an icon leaves a bright rectangle sitting over
+// the desktop. So it is shown at full opacity for TOOLTIP_HOLD and then fades
+// out over TOOLTIP_FADE.
+//
+// Asymmetric on purpose, and the asymmetry is the point: instant in is what
+// makes the label feel like an answer to the pointer, and a slow out is what
+// keeps its disappearance from reading as a second event. Fading it in as well
+// would just be the 500 ms tooltip delay this label exists to avoid.
+constexpr double TOOLTIP_HOLD = 4.0;    // seconds at full opacity
+constexpr double TOOLTIP_FADE = 0.6;    // seconds to fade out over
+
 // Vertical headroom above a fully magnified icon: enough for the name label,
 // and for the launch bounce, which lifts an icon by BOUNCE_HEIGHT and clips
 // against the top of the surface without room to move into.
@@ -823,17 +836,33 @@ class DockEngine {
         }
 
         if (!hovered_index_.has_value() || *hovered_index_ >= icons_.size()) {
-            gtk_widget_set_visible(tooltip_, FALSE);
+            hide_tooltip();
             return;
         }
 
         const IconRuntime& icon = icons_[*hovered_index_];
+
+        // A different icon is a different label: it comes up at full opacity
+        // and starts its hold again. Keyed on identity rather than on the title
+        // because two entries can share a Name, and moving between them is
+        // still a move.
+        if (icon.desktop_id != tooltip_desktop_id_) {
+            tooltip_desktop_id_ = icon.desktop_id;
+            show_tooltip();
+        }
+
+        // Already faded out, with the pointer still on the same icon. Leave it
+        // down: re-showing it here is what update_tooltip would otherwise do
+        // every frame, and the fade would never be visible for more than one.
+        if (!tooltip_up_) {
+            return;
+        }
+
         if (icon.title != tooltip_text_) {
             tooltip_text_ = icon.title;
             gtk_label_set_text(GTK_LABEL(tooltip_), tooltip_text_.c_str());
             tooltip_w_ = -1;   // measurement is stale
         }
-        gtk_widget_set_visible(tooltip_, TRUE);
 
         // Measuring a GtkLabel runs a Pango layout, which is expensive enough
         // to show up as frame-time spikes: doing it every frame took p95 from
@@ -860,6 +889,87 @@ class DockEngine {
                              ? icon_baseline_y_ + icon.current_width + TOOLTIP_GAP
                              : icon_baseline_y_ - icon.current_width - TOOLTIP_GAP - natural_h;
         gtk_fixed_move(GTK_FIXED(root_fixed_), tooltip_, x, std::max(0.0, y));
+    }
+
+    // LUCID_DOCK_TOOLTIP_TRACE=1: when the label came up, when it started
+    // fading and when it went. The timings are the whole feature and none of
+    // them are visible in a screenshot.
+    void trace_tooltip(const char* what) const {
+        if (g_getenv("LUCID_DOCK_TOOLTIP_TRACE") != nullptr) {
+            g_message("tooltip: %s [%s]", what, tooltip_desktop_id_.c_str());
+        }
+    }
+
+    // Up at full opacity, and the hold starts now.
+    void show_tooltip() {
+        tooltip_up_ = true;
+        tooltip_fade_started_at_ = 0.0;
+        gtk_widget_set_opacity(tooltip_, 1.0);
+        gtk_widget_set_visible(tooltip_, TRUE);
+        trace_tooltip("shown");
+
+        // A one-shot timer rather than checking the clock every frame: the
+        // pointer resting on an icon is the case where the dock has otherwise
+        // stopped ticking entirely, and spinning the frame clock for four
+        // seconds to discover that four seconds have passed would undo the work
+        // that stops it.
+        cancel_tooltip_fade();
+        tooltip_fade_timer_ = g_timeout_add(static_cast<guint>(TOOLTIP_HOLD * 1000.0),
+                                            &DockEngine::on_tooltip_fade_static, this);
+    }
+
+    // Off the dock, or off the items. Instant, and it forgets which icon it was
+    // for, so coming back to the same icon shows it again rather than finding
+    // it already expired.
+    void hide_tooltip() {
+        cancel_tooltip_fade();
+        if (tooltip_up_) {
+            trace_tooltip("hidden (pointer left)");
+        }
+        tooltip_up_ = false;
+        tooltip_fade_started_at_ = 0.0;
+        tooltip_desktop_id_.clear();
+        gtk_widget_set_visible(tooltip_, FALSE);
+        gtk_widget_set_opacity(tooltip_, 1.0);
+    }
+
+    void cancel_tooltip_fade() {
+        if (tooltip_fade_timer_ != 0) {
+            g_source_remove(tooltip_fade_timer_);
+            tooltip_fade_timer_ = 0;
+        }
+    }
+
+    static gboolean on_tooltip_fade_static(gpointer user_data) {
+        auto* self = static_cast<DockEngine*>(user_data);
+        self->tooltip_fade_timer_ = 0;
+        // The label may have been hidden or moved to another icon in the four
+        // seconds since this was armed, in which case there is nothing to fade.
+        if (self->tooltip_up_ && self->tooltip_fade_started_at_ <= 0.0) {
+            self->tooltip_fade_started_at_ = monotonic_seconds();
+            self->trace_tooltip("fade start");
+            self->ensure_tick();
+        }
+        return G_SOURCE_REMOVE;
+    }
+
+    // Same easing as the launch bounce, so the dock has one vocabulary of
+    // motion rather than one per animation.
+    bool step_tooltip_fade(double now) {
+        if (!tooltip_up_ || tooltip_fade_started_at_ <= 0.0) {
+            return false;
+        }
+        const double progress = (now - tooltip_fade_started_at_) / TOOLTIP_FADE;
+        if (progress >= 1.0) {
+            tooltip_up_ = false;
+            tooltip_fade_started_at_ = 0.0;
+            gtk_widget_set_visible(tooltip_, FALSE);
+            gtk_widget_set_opacity(tooltip_, 1.0);
+            trace_tooltip("faded out");
+            return false;
+        }
+        gtk_widget_set_opacity(tooltip_, 1.0 - sine_in_out(progress));
+        return true;
     }
 
     bool pointer_is_on_panel(double x, double y) const {
@@ -1259,7 +1369,9 @@ class DockEngine {
 
         const bool widths_moving = step_widths(dt);
         const bool offsets_moving = step_offsets(dt);
-        animations_running = animations_running || widths_moving || offsets_moving;
+        const bool tooltip_fading = step_tooltip_fade(now);
+        animations_running =
+            animations_running || widths_moving || offsets_moving || tooltip_fading;
 
         if (g_getenv("LUCID_BENCH_IDLE") != nullptr) {
             layout_dirty_ = false;
@@ -2540,6 +2652,12 @@ window {
     GtkWidget* panel_fixed_ = nullptr;
     GtkWidget* tooltip_ = nullptr;
     std::string tooltip_text_;
+    // Which icon the label is currently for, whether it is still up, and when
+    // its fade began (0 while it is holding at full opacity).
+    std::string tooltip_desktop_id_;
+    bool tooltip_up_ = false;
+    double tooltip_fade_started_at_ = 0.0;
+    guint tooltip_fade_timer_ = 0;
     int tooltip_w_ = -1;   // cached natural size; -1 means re-measure
     int tooltip_h_ = 0;
     std::optional<std::size_t> hovered_index_;

@@ -446,6 +446,46 @@ animated width so it rides the magnification instead of trailing it. GTK has no
 `backdrop-filter`, so the reference's 50%-white-plus-5px-blur is approximated
 with a slightly more opaque fill.
 
+### It goes away on its own
+
+Instant in, slow out. The label holds at full opacity for `TOOLTIP_HOLD` (4 s)
+and then fades over `TOOLTIP_FADE` (0.6 s), easing with the same `sine_in_out`
+the launch bounce uses so the dock has one vocabulary of motion rather than one
+per animation.
+
+The asymmetry is the point. Appearing instantly is what makes the label read as
+an answer to the pointer -- that is the whole reason it is not GTK's stock
+tooltip, which waits 500 ms. Fading it *in* would put that delay straight back.
+But a label that has been up for four seconds has already been read, and
+holding it for as long as the pointer happens to rest on an icon leaves a
+bright rectangle sitting over the desktop. Nothing is gained by keeping it.
+
+The rules, all four verified end to end by driving a real pointer in a nested
+sway with `swaymsg seat - cursor set`:
+
+| | |
+|---|---|
+| Pointer reaches an icon | up at full opacity, +20 ms |
+| Held there | fade begins at +4.004 s, gone 0.616 s later |
+| Still on the same icon after it has gone | stays gone -- it is not re-shown every frame |
+| Pointer reaches a *different* icon | up again instantly, with a fresh hold |
+| Mid-fade, pointer reaches another icon | back to full opacity, hold restarts (measured 4.005 s, not the remainder) |
+| Pointer leaves the dock | hidden immediately |
+
+The hold is a one-shot `g_timeout`, not a check on the frame clock. A pointer
+resting on an icon is exactly the case where the dock has stopped ticking, and
+spinning the frame clock for four seconds to discover that four seconds have
+passed would undo the work that stops it. The timer arms on show, is cancelled
+on hide, and re-arms when the label moves to another icon; the fade itself runs
+on the tick, which the timer starts.
+
+`LUCID_DOCK_TOOLTIP_TRACE=1` logs shown / fade start / faded out / hidden with
+timestamps. The timings are the whole feature and none of them are visible in a
+screenshot. Instrumenting the per-frame opacity during a fade gives 56 samples
+across two fades and the expected ease-in-out shape -- 1.000, 0.939, 0.792,
+0.592, 0.376, 0.183, 0.050, 0.000 -- which is what distinguishes a fade from a
+label that sits still and then vanishes.
+
 It needs headroom, so the surface is now 198 px rather than 160 at `MaxScale`
 2.0. **Known consequence:** the dock's surface is monitor-wide and now taller,
 and a layer surface takes pointer input across its whole area unless an input
