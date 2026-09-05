@@ -259,32 +259,12 @@ std::vector<std::string> exec_candidates(const std::string& exec_line, const std
 
 std::unordered_set<std::string> collect_running_process_names();
 
-std::filesystem::path find_icon_in_lucid_theme(const std::string& icon_name) {
-    if (icon_name.empty()) {
-        return {};
-    }
-
-    static const std::vector<std::string> kSearchSubdirs = {
-        "scalable/apps",
-        "256x256/apps",
-        "128x128/apps",
-        "64x64/apps",
-        "512x512/apps",
-    };
-    static const std::vector<std::string> kExtensions = {"svg", "png", "xpm"};
-
-    const std::filesystem::path theme_dir("/usr/share/icons/Lucid-Light");
-    for (const auto& subdir : kSearchSubdirs) {
-        for (const auto& ext : kExtensions) {
-            const std::filesystem::path candidate = theme_dir / subdir / (icon_name + "." + ext);
-            if (std::filesystem::is_regular_file(candidate)) {
-                return candidate;
-            }
-        }
-    }
-
-    return {};
-}
+// Icon lookup is GtkIconTheme's job. This used to walk
+// /usr/share/icons/Lucid-Light by hand across a fixed list of size
+// directories, which meant every icon fell back to a generic one on any
+// machine without that theme installed -- and skipped the inheritance and
+// fallback chain that the icon theme specification defines and GTK already
+// implements. The theme to prefer is now a setting; empty follows the desktop.
 
 // What to pin when there is no config file and no GNOME to borrow from. One
 // entry per role, first match wins, anything not installed is skipped -- so
@@ -643,6 +623,7 @@ class DockEngine {
                   "Rebuild with gtk4-layer-shell.");
     #endif
 
+        apply_icon_theme();
         install_css();
 
         root_fixed_ = gtk_fixed_new();
@@ -1580,10 +1561,8 @@ class DockEngine {
             paintable = gtk_icon_paintable_new_for_file(file, icon_source_size(), scale);
             g_object_unref(file);
         } else {
-            GdkDisplay* display = window_ != nullptr ? gtk_widget_get_display(window_)
-                                                     : gdk_display_get_default();
-            if (display != nullptr) {
-                GtkIconTheme* theme = gtk_icon_theme_get_for_display(display);
+            GtkIconTheme* theme = lookup_theme();
+            {
                 const char* fallbacks[] = {"application-x-executable", nullptr};
                 paintable = gtk_icon_theme_lookup_icon(
                     theme,
@@ -1660,23 +1639,13 @@ class DockEngine {
             icon.fixed = gtk_fixed_new();
             gtk_button_set_child(GTK_BUTTON(icon.button), icon.fixed);
 
+            // An absolute path in the desktop file is used as-is; anything
+            // else is a name, and names are the icon theme's business.
             if (!icon.icon_name.empty() && std::filesystem::is_regular_file(icon.icon_name)) {
                 icon.resolved_file = icon.icon_name;
             } else {
-                std::filesystem::path theme_file = find_icon_in_lucid_theme(icon.icon_name);
-                if (theme_file.empty() && !icon.icon_name.empty()) {
-                    const std::filesystem::path stem = std::filesystem::path(icon.icon_name).stem();
-                    if (!stem.empty() && stem.string() != icon.icon_name) {
-                        theme_file = find_icon_in_lucid_theme(stem.string());
-                    }
-                }
-
-                if (!theme_file.empty()) {
-                    icon.resolved_file = theme_file;
-                } else {
-                    icon.resolved_icon_name =
-                        icon.icon_name.empty() ? "application-x-executable" : icon.icon_name;
-                }
+                icon.resolved_icon_name =
+                    icon.icon_name.empty() ? "application-x-executable" : icon.icon_name;
             }
 
             icon.current_width = base_width_;
@@ -2263,6 +2232,69 @@ class DockEngine {
         last_icon_scale_ = 0;
     }
 
+    // Empty IconTheme means "whatever the desktop is set to", which is what a
+    // dock should do by default. Setting it overrides that for this process
+    // only -- the dock does not reach into the user's desktop settings to get
+    // the icons it wants.
+    void apply_icon_theme() {
+        GdkDisplay* display = window_ != nullptr ? gtk_widget_get_display(window_)
+                                                 : gdk_display_get_default();
+        if (display == nullptr) {
+            return;
+        }
+        GtkIconTheme* desktop_theme = gtk_icon_theme_get_for_display(display);
+
+        if (config_.icon_theme.empty()) {
+            const char* name =
+                desktop_theme != nullptr ? gtk_icon_theme_get_theme_name(desktop_theme) : nullptr;
+            g_message("icon theme: %s (from the desktop)", name != nullptr ? name : "(none)");
+            return;
+        }
+
+        // An owned GtkIconTheme, not the display's. The display's tracks
+        // GtkSettings' gtk-icon-theme-name and overwrites anything set on it,
+        // so asking for a theme there silently does nothing. This one is ours
+        // and answers for itself -- and using it keeps the choice local to the
+        // dock rather than changing the icons of every application.
+        if (icon_theme_ != nullptr) {
+            g_object_unref(icon_theme_);
+            icon_theme_ = nullptr;
+        }
+        icon_theme_ = gtk_icon_theme_new();
+        if (desktop_theme != nullptr) {
+            if (char** path = gtk_icon_theme_get_search_path(desktop_theme)) {
+                gtk_icon_theme_set_search_path(icon_theme_, path);
+                g_strfreev(path);
+            }
+        }
+        gtk_icon_theme_set_theme_name(icon_theme_, config_.icon_theme.c_str());
+
+        // Ask whether it actually resolved, rather than whether it was set:
+        // GTK falls back to hicolor for a theme that is not installed and says
+        // nothing. Not checking is how the dock spent months pointing at a
+        // theme that was not on the machine.
+        if (!gtk_icon_theme_has_icon(icon_theme_, "folder")) {
+            g_warning("icon theme '%s' is not installed, or has no 'folder' icon -- "
+                      "falling back to the desktop's. Install it under "
+                      "/usr/share/icons or ~/.local/share/icons, in a directory "
+                      "whose index.theme Name matches.",
+                      config_.icon_theme.c_str());
+            g_object_unref(icon_theme_);
+            icon_theme_ = nullptr;
+            return;
+        }
+        g_message("icon theme: %s (from dock.conf)", config_.icon_theme.c_str());
+    }
+
+    GtkIconTheme* lookup_theme() {
+        if (icon_theme_ != nullptr) {
+            return icon_theme_;
+        }
+        GdkDisplay* display = window_ != nullptr ? gtk_widget_get_display(window_)
+                                                 : gdk_display_get_default();
+        return display != nullptr ? gtk_icon_theme_get_for_display(display) : nullptr;
+    }
+
     void install_css() {
         static const char* kCss = R"CSS(
 window {
@@ -2360,6 +2392,7 @@ window {
     GSimpleActionGroup* actions_ = nullptr;
     GFileMonitor* config_monitor_ = nullptr;
     guint launch_poll_id_ = 0;
+    GtkIconTheme* icon_theme_ = nullptr;   // owned only when IconTheme is set
     std::map<std::string, WorkStat> work_;
 
     // Parsing 148 .desktop files costs ~15 ms. The set of installed

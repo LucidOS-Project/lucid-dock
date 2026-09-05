@@ -238,6 +238,11 @@ struct DockConfig {
     // different GTK versions -- which is exactly why nothing is hardcoded.
     std::string renderer;
 
+    // Icon theme to prefer, or empty to follow whatever the desktop is set to.
+    // Empty is the right default: a dock that hardcodes one theme shows generic
+    // fallback icons on every machine that does not have it installed.
+    std::string icon_theme;
+
     std::string layout_mode = "dock";   // dock | taskbar
     std::string position = "bottom";    // bottom | left | right | top
     int icon_size = 0;                  // 0 = the built-in 57.6 px
@@ -321,7 +326,8 @@ inline bool read_config(DockConfig& config) {
         g_clear_error(&error);
     }
 
-    for (const auto& [key, target] : {std::pair<const char*, std::string*>{"LayoutMode", &config.layout_mode},
+    for (const auto& [key, target] : {std::pair<const char*, std::string*>{"IconTheme", &config.icon_theme},
+                                      std::pair<const char*, std::string*>{"LayoutMode", &config.layout_mode},
                                       std::pair<const char*, std::string*>{"Position", &config.position}}) {
         gchar* value = g_key_file_get_string(keyfile, kConfigGroup, key, nullptr);
         if (value != nullptr) {
@@ -360,9 +366,12 @@ inline bool write_config(const DockConfig& config) {
     g_key_file_set_double(keyfile, kConfigGroup, "Spread", config.spread);
     g_key_file_set_integer(keyfile, kConfigGroup, "IconSize", config.icon_size);
     g_key_file_set_string(keyfile, kConfigGroup, "Renderer", config.renderer.c_str());
+    g_key_file_set_string(keyfile, kConfigGroup, "IconTheme", config.icon_theme.c_str());
     g_key_file_set_string(keyfile, kConfigGroup, "LayoutMode", config.layout_mode.c_str());
     g_key_file_set_string(keyfile, kConfigGroup, "Position", config.position.c_str());
 
+    g_key_file_set_comment(keyfile, kConfigGroup, "IconTheme",
+        " Icon theme name, e.g. Lucid-Light. Empty follows the desktop setting.", nullptr);
     g_key_file_set_comment(keyfile, kConfigGroup, "Renderer",
         " GSK renderer: empty for GTK's default, or gl / ngl / vulkan / cairo.\n"
         " GSK_RENDERER in the environment overrides this.\n"
