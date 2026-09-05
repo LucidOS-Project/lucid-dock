@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # sway gives the tests a real layer-shell compositor with a headless
+      # backend, so they run the anchored path rather than the unanchored
+      # fallback -- which is the path that ships, and which differs from the
+      # fallback by about 35 MiB of RAM.
+      # libwayland-bin is wayland-scanner; the foreign-toplevel protocol XML is
+      # vendored, so wayland-protocols is deliberately not needed.
+      - name: Install build and test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config \
+            libgtk-4-dev libglib2.0-dev libwayland-dev libwayland-bin \
+            meson ninja-build git ca-certificates \
+            sway
+
+      # Not packaged before Ubuntu 25.10, so 24.04 runners build it. Same
+      # ~/.local prefix the README documents for a development host, and the
+      # build script picks that up on its own.
+      - name: Build gtk4-layer-shell
+        run: |
+          git clone --depth 1 https://github.com/wmww/gtk4-layer-shell.git /tmp/gls
+          cd /tmp/gls
+          meson setup build --prefix="$HOME/.local" \
+            -Dexamples=false -Ddocs=false -Dtests=false \
+            -Dintrospection=false -Dvapi=false
+          meson compile -C build
+          meson install -C build
+
+      - name: Build (build_lucid_dock.sh)
+        working-directory: macoswebproto
+        run: ./build_lucid_dock.sh
+
+      # The binaries stamp their own git rev and build time. If this prints
+      # "unknown" the stamping has broken, which is how a stale binary gets
+      # measured for an afternoon.
+      - name: Report what was built
+        working-directory: macoswebproto
+        run: |
+          ./lucid_dock_cpp --version
+          ./lucid_dock_settings --version
+
+      - name: Build (CMake)
+        working-directory: macoswebproto
+        run: |
+          export PKG_CONFIG_PATH="$HOME/.local/lib/$(gcc -dumpmachine)/pkgconfig:$PKG_CONFIG_PATH"
+          cmake -S . -B build/ci
+          cmake --build build/ci
+          ./build/ci/lucid_dock_cpp --version
+
+      - name: Foreign-toplevel protocol tests
+        working-directory: macoswebproto
+        run: ./tests/run_toplevel_source_tests.sh
+
+      # A dock runs for the whole session, so what it costs in RAM is a promise
+      # in the same way 60 fps is. Budgets the dock's cost above an empty GTK4
+      # window, so a GTK or Mesa upgrade does not fail this check.
+      - name: Memory budget
+        working-directory: macoswebproto
+        run: |
+          export XDG_RUNTIME_DIR=/tmp/xdg-runtime
+          mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
+          ./tests/check_memory_budget.sh
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs
+          path: |
+            macoswebproto/build/ci/CMakeFiles/*.log
+          if-no-files-found: ignore

@@ -15,6 +15,7 @@ LucidOS desktop is built around (see "Why out-of-process" below).
 | `macoswebproto/protocols/` | Vendored Wayland protocol XML (the two foreign-toplevel protocols) |
 | `macoswebproto/tests/` | A fake compositor for the protocol no compositor here implements |
 | `macoswebproto/tools/render_panel.c` | Renders the panel through GSK to a PNG, for measuring what GTK actually draws |
+| `.github/workflows/ci.yml` | Builds both ways, runs the protocol tests and the memory budget |
 | `macoswebproto/dock_settings_page.cpp` | The settings UI, as a widget |
 | `macoswebproto/lucid_dock_settings.cpp` | ~20 line wrapper making that widget a window |
 | `macoswebproto/lucid_dock.py` | Python implementation of the same design |
@@ -900,6 +901,70 @@ costs nothing on 4.14 and buys 3x over the 26.04 default.
 
 Renderer choice still belongs in a per-GPU capability tier for the desktop as a
 whole rather than in one application — the same problem as the visual tiers.
+
+## What it costs in RAM
+
+A dock runs for the whole session, so what it costs resident is a promise to
+the user in the same way 60 fps is -- and it regresses the same way, quietly,
+in a commit about something else. `tests/check_memory_budget.sh` is the check
+that makes that loud, and CI runs it.
+
+Measured under headless sway, so these are the anchored path:
+
+| | PSS |
+|---|---|
+| An empty GTK4 window | 34.6 MiB |
+| `lucid_dock_cpp` | 44.2 MiB |
+| **the dock's own cost** | **9.6 MiB** |
+
+Repeatable to 0.1 MiB across runs. Three decisions make that number mean
+something:
+
+**PSS, not RSS.** RSS charges the dock for every shared library page in full,
+whether or not anything else maps them. PSS divides shared pages by the number
+of processes mapping them, and is the only figure that adds up correctly across
+a session. The dock's RSS is about 130 MiB; that number is not wrong, it just
+cannot be added to anything.
+
+**The budget is on the delta, not the absolute.** Four fifths of the absolute
+figure is GTK and Mesa, which this project does not control and which moves on
+every toolkit upgrade. Budgeting the absolute means a GTK release fails the
+check and everyone learns to raise the limit. Budgeting the dock's own cost
+fails only when the dock's own code gets heavier.
+
+**The environment is part of the measurement.** The anchored path and GNOME's
+unanchored fallback differ by roughly 35 MiB, so the check runs its own
+headless compositor rather than trusting whatever session it is invoked from.
+It uses its own `XDG_CONFIG_HOME` too -- the dock writes its config on first
+run, and the pinned list decides how many icons get rasterised, which is most
+of the number being measured.
+
+`XDG_CACHE_HOME` is deliberately *not* isolated. Doing so was tried and cost
+11 MiB on the empty-window floor alone, because a cold cache makes Mesa
+recompile its shaders and fontconfig rebuild -- neither of which a running
+desktop pays. That measures the first second of the first boot rather than
+what a user lives with.
+
+### Where the RAM actually goes, for scale
+
+Measured on the same machine, in a stock Zorin/GNOME session:
+
+| | PSS |
+|---|---|
+| `gnome-shell` | 294.6 MiB |
+| `gnome-software` -- **no window**, `--gapplication-service` | 321.7 MiB |
+| `nautilus` -- **no window**, `--gapplication-service` | 163.8 MiB |
+| evolution-\* (4 processes) | 53.9 MiB |
+| gjs, gsd-\*, portals, ibus | 38.8 MiB |
+| **those alone** | **872.8 MiB** |
+| `lucid_dock_cpp` | 50.0 MiB |
+
+Two windowless background services account for 485 MiB, more than the shell
+itself. A toolkit is not what makes a desktop heavy; a service constellation
+is. An empty GTK4 window is 4% of that total, which is worth knowing before
+concluding that the toolkit is the problem -- for reference, `foot`, a lean
+Wayland terminal in C, measures 10.6 MiB, so leaving GTK entirely would save
+roughly 35 MiB per surface.
 
 ## Why out-of-process
 
