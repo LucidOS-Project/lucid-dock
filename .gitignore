@@ -6,3 +6,11 @@ lucid_dock_cpp
 lucid_dock_settings
 *.pyc
 __pycache__/
+debian/.debhelper/
+debian/lucid-dock/
+debian/files
+debian/*.substvars
+debian/debhelper-build-stamp
+obj-*-linux-gnu/
+debian/*.debhelper.log
+debian/*.debhelper

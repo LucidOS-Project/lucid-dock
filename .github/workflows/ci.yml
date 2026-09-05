@@ -146,6 +146,46 @@ jobs:
             echo "the supervisor quarantined a layer on a healthy run"; exit 1
           fi
 
+      # The .deb is the deliverable, so the packaging is built on every push
+      # rather than the day of a release, which is the day it is least
+      # convenient to discover that debian/rules has rotted.
+      #
+      # This runner is 24.04, where gtk4-layer-shell is not packaged -- the
+      # step above built it into ~/.local -- so LUCID_DEV_LIBDIR is set and the
+      # resulting .deb records no dependency on it. That artifact is not
+      # publishable and the build says so out loud. What is being checked here
+      # is debian/control, debian/rules and the install layout, all of which are
+      # the same on the target.
+      - name: Build the Debian package
+        env:
+          LUCID_DEV_LIBDIR: /home/runner/.local/lib/x86_64-linux-gnu
+        run: |
+          sudo apt-get install -y --no-install-recommends dpkg-dev debhelper
+          export PKG_CONFIG_PATH="$HOME/.local/lib/x86_64-linux-gnu/pkgconfig:$PKG_CONFIG_PATH"
+          dpkg-buildpackage -us -uc -b -d
+          deb=$(ls ../lucid-dock_*.deb)
+          echo "built $deb"
+          dpkg-deb -I "$deb"
+          # The package must contain the installed names, not the build-tree
+          # ones: a user types lucid-dock, and lucid-session-start resolves it
+          # by that name.
+          dpkg-deb -c "$deb" | grep -q ' ./usr/bin/lucid-dock$'
+          dpkg-deb -c "$deb" | grep -q ' ./usr/bin/lucid-dock-settings$'
+          dpkg-deb -c "$deb" | grep -q ' ./usr/share/applications/lucid-dock-settings.desktop$'
+          # A RUNPATH into somebody's home directory is meaningless on a user's
+          # machine, and Debian policy forbids one pointing outside the package.
+          dpkg-deb -x "$deb" /tmp/debroot
+          if objdump -x /tmp/debroot/usr/bin/lucid-dock | grep -E 'RUNPATH|RPATH'; then
+            echo "the packaged binary carries an rpath"; exit 1
+          fi
+
+      - name: Upload the package
+        uses: actions/upload-artifact@v4
+        with:
+          name: lucid-dock-deb
+          path: ../lucid-dock_*.deb
+          if-no-files-found: error
+
       - name: Upload logs on failure
         if: failure()
         uses: actions/upload-artifact@v4

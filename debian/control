@@ -1,0 +1,34 @@
+Source: lucid-dock
+Section: x11
+Priority: optional
+Maintainer: Javid Medina <javidamedina@gmail.com>
+Build-Depends: debhelper-compat (= 13),
+               cmake,
+               pkg-config,
+               libgtk-4-dev,
+               libglib2.0-dev,
+               libwayland-dev,
+               libwayland-bin,
+               libgtk4-layer-shell-dev
+Standards-Version: 4.6.2
+Homepage: https://github.com/LucidOS-Project/lucid-dock
+Rules-Requires-Root: no
+
+Package: lucid-dock
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Recommends: lucid-session
+Description: magnifying macOS-style dock for Wayland
+ A dock for Wayland compositors that implement wlr-layer-shell, implemented as
+ an ordinary layer-shell client rather than as part of a compositor. A dock that
+ crashes should cost you a dock, not your session.
+ .
+ Icons magnify under the pointer with a damped spring derived from the reference
+ implementation rather than tuned by eye, applications that are running are
+ marked using the foreign-toplevel protocols rather than by guessing at process
+ names, and the panel's geometry, motion and stylesheet values are settings with
+ provenance rather than constants.
+ .
+ This package is useful on its own: it works on KWin, sway, Hyprland, labwc and
+ COSMIC, and does not require the rest of LucidOS. It does not work on GNOME,
+ because Mutter does not implement wlr-layer-shell.

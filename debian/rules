@@ -1,0 +1,44 @@
+#!/usr/bin/make -f
+
+# The CMakeLists is in macoswebproto/, not at the root: the repository grew from
+# a web prototype and the C++ dock lives beside what it was ported from.
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+%:
+	dh $@ --buildsystem=cmake --sourcedirectory=macoswebproto
+
+# CMAKE_SKIP_INSTALL_RPATH: on a development host gtk4-layer-shell is built into
+# ~/.local and CMake writes that path into the binary as a RUNPATH. That is
+# correct there and forbidden in a package -- Debian policy does not allow a
+# RUNPATH pointing outside the package, and a path under some build machine's
+# home directory is meaningless on a user's system anyway. On the target,
+# gtk4-layer-shell is libgtk4-layer-shell-dev from the archive and the dynamic
+# linker finds it without help.
+override_dh_auto_configure:
+	dh_auto_configure -- -DCMAKE_SKIP_INSTALL_RPATH=ON
+
+# The protocol tests need a compositor and the memory budget needs a headless
+# one; both run in CI, where there is something to run them against. A package
+# build is not the place to require a Wayland session.
+override_dh_auto_test:
+	macoswebproto/build/lucid_dock_cpp --version || true
+
+# The development-host escape hatch, and the only one.
+#
+# On the target, gtk4-layer-shell is libgtk4-layer-shell-dev from the archive:
+# dpkg-shlibdeps finds it on the default search path, reads the package that owns
+# it, and writes a real dependency into ${shlibs:Depends}. Nothing below runs.
+#
+# On a 24.04 host the library is not packaged at all -- it is built into ~/.local
+# -- so shlibdeps has to be told where it is *and* told that no package owns it.
+# A .deb built this way has no dependency on gtk4-layer-shell recorded, which is
+# wrong for distribution and fine for checking that the packaging itself works.
+# It is one variable rather than two so there is one thing to not set on a
+# release build.
+ifneq ($(LUCID_DEV_LIBDIR),)
+override_dh_shlibdeps:
+	@echo "WARNING: development build -- gtk4-layer-shell dependency will NOT be"
+	@echo "WARNING: recorded. Do not publish this .deb. Build on Ubuntu 26.04,"
+	@echo "WARNING: where libgtk4-layer-shell-dev is a real package."
+	dh_shlibdeps -- -l$(LUCID_DEV_LIBDIR) --ignore-missing-info
+endif

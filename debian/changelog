@@ -1,0 +1,14 @@
+lucid-dock (0.1.0-1) noble; urgency=medium
+
+  * First packaged release.
+  * Magnification driven by a single 0..1 envelope rather than per-icon
+    springs, so a fast sweep magnifies exactly as much as a slow one.
+  * Running applications detected through ext-foreign-toplevel-list-v1 or
+    zwlr-foreign-toplevel-management-v1, falling back to /proc only where
+    neither exists.
+  * Geometry, motion and stylesheet values read from lucid-tokens, with
+    per-key provenance, live reload and per-key reset.
+  * Icons normalised to a common ink ratio, so an application shipping its
+    own icon under hicolor no longer stands taller than the rest.
+
+ -- Javid Medina <javidamedina@gmail.com>  Sat, 05 Sep 2026 13:30:00 +0000

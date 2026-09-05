@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Lucid Dock
+Comment=The LucidOS dock
+Exec=lucid-dock
+Icon=lucid-dock
+Categories=Utility;
+Terminal=false
+# The dock is a shell component, not something to launch from a menu. It is
+# listed only so a session can autostart it by desktop id and so a "run at
+# login" checkbox has something to point at.
+NoDisplay=true
+X-GNOME-Autostart-enabled=false

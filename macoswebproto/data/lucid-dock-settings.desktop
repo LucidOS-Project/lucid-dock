@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Dock Settings
+Comment=Size, magnification and the pinned applications on the LucidOS dock
+Exec=lucid-dock-settings
+Icon=preferences-desktop
+Categories=Settings;DesktopSettings;GTK;
+Terminal=false
+Keywords=dock;launcher;taskbar;magnification;

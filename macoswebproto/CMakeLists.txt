@@ -143,3 +143,39 @@ target_include_directories(lucid_dock_settings PRIVATE "${CMAKE_CURRENT_SOURCE_D
 	"${LUCID_TOKENS_DIR}/include")
 add_dependencies(lucid_dock_settings lucid_build_stamp)
 target_link_libraries(lucid_dock_settings PRIVATE PkgConfig::GTK4 PkgConfig::GIO_UNIX)
+
+# ---------------------------------------------------------------------------
+# Installation
+#
+# The binaries are named lucid_dock_cpp and lucid_dock_settings in the build
+# tree, for historical reasons and because the C++ one lived beside a Python
+# one for a while. Installed, they are lucid-dock and lucid-dock-settings:
+# a user types the installed name, and it should look like every other command
+# on the system rather than like a build artifact that escaped.
+#
+# The dock's right-click menu already looks for the settings binary beside
+# itself first and then on PATH, so both the build tree and an install work
+# without either knowing which it is.
+include(GNUInstallDirs)
+
+install(TARGETS lucid_dock_cpp
+	RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+install(TARGETS lucid_dock_settings
+	RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+
+# CMake cannot rename an installed target, so the rename happens here.
+#
+# $ENV{DESTDIR} is not decoration. Packaging always installs into a staging
+# root, and CMAKE_INSTALL_PREFIX alone points at the real / -- so without it
+# this reaches outside the staging tree, fails, and on a machine where it
+# happened to succeed it would have been renaming the system's own files.
+install(CODE "
+	set(_bindir \"\$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}\")
+	file(RENAME \"\${_bindir}/lucid_dock_cpp\"      \"\${_bindir}/lucid-dock\")
+	file(RENAME \"\${_bindir}/lucid_dock_settings\" \"\${_bindir}/lucid-dock-settings\")
+")
+
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/data/lucid-dock.desktop"
+	DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/applications")
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/data/lucid-dock-settings.desktop"
+	DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/applications")
