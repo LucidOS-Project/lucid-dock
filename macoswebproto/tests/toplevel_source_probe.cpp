@@ -1,13 +1,13 @@
 // Runs the dock's real ToplevelSource against whatever compositor
 // WAYLAND_DISPLAY points at, and prints the running key set every time it
-// changes. Linked against toplevel_source.cpp itself rather than a copy, so
+// changes. Linked against lucid-wayland's source itself rather than a copy, so
 // what is tested is what ships.
 //
 // Used by run_toplevel_source_tests.sh to exercise
 // ext-foreign-toplevel-list-v1, which no compositor on a 24.04-era host
 // implements.
 
-#include "../toplevel_source.h"
+#include "lucid/toplevel_source.h"
 
 #include <glib.h>
 

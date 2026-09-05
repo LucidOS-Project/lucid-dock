@@ -12,14 +12,16 @@ cd "$(dirname "$0")"
 build=$(mktemp -d)
 trap 'rm -rf "$build"; [ -n "${fake_pid:-}" ] && kill "$fake_pid" 2>/dev/null || true' EXIT
 
-proto=../protocols/ext-foreign-toplevel-list-v1.xml
+# The protocol XML moved to lucid-wayland with the client that speaks it.
+WL=../third_party/lucid-wayland
+proto=$WL/protocols/ext-foreign-toplevel-list-v1.xml
 wayland-scanner server-header "$proto" "$build/ext-foreign-toplevel-list-v1-server-protocol.h"
 wayland-scanner client-header "$proto" "$build/ext-foreign-toplevel-list-v1-client-protocol.h"
 wayland-scanner private-code  "$proto" "$build/ext-protocol.c"
 
-# The client side also links the wlr marshalling, because toplevel_source.cpp
+# The client side also links the wlr marshalling, because the toplevel source
 # contains both backends.
-wlr=../protocols/wlr-foreign-toplevel-management-unstable-v1.xml
+wlr=$WL/protocols/wlr-foreign-toplevel-management-unstable-v1.xml
 wayland-scanner client-header "$wlr" "$build/wlr-foreign-toplevel-management-unstable-v1-client-protocol.h"
 wayland-scanner private-code  "$wlr" "$build/wlr-protocol.c"
 
@@ -29,7 +31,13 @@ gcc -std=c11 -O1 -g -c "$build/wlr-protocol.c" -o "$build/wlr-protocol.o" $(pkg-
 gcc -std=gnu11 -Wall -Wextra -O1 -g -I"$build" fake_ext_compositor.c "$build/ext-protocol.o" \
     -o "$build/fake_ext_compositor" $(pkg-config --cflags --libs wayland-server)
 
-g++ -std=c++20 -O1 -g -I"$build" toplevel_source_probe.cpp ../toplevel_source.cpp \
+# Built against lucid-wayland's sources rather than its library, so the probe
+# gets the same protocol headers the fake compositor was generated from -- the
+# point of this test is that the client and the server agree, and linking a
+# prebuilt .a would let them be generated from different XML without anyone
+# noticing.
+g++ -std=c++20 -O1 -g -I"$build" -I"$WL/include" \
+    toplevel_source_probe.cpp "$WL/src/toplevel_source.cpp" \
     "$build/ext-protocol.o" "$build/wlr-protocol.o" -o "$build/probe" \
     $(pkg-config --cflags --libs glib-2.0 gio-2.0 wayland-client)
 

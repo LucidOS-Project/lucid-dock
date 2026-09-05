@@ -11,11 +11,18 @@ export PKG_CONFIG_PATH="$LOCAL_LIBDIR/pkgconfig:$HOME/.local/lib/pkgconfig:${PKG
 # lucid-tokens is a submodule, pinned to a commit, so the schema and the dock
 # cannot drift apart the way they already did once -- two of fifteen keys were
 # configuring an easing the dock had deleted.
-if [ ! -f third_party/lucid-tokens/src/tokens.cpp ]; then
-    echo "Missing third_party/lucid-tokens. Run:" >&2
-    echo "  git submodule update --init --recursive" >&2
-    exit 1
-fi
+for sub in lucid-tokens lucid-wayland; do
+    if [ ! -d "third_party/$sub/src" ]; then
+        echo "Missing third_party/$sub. Run:" >&2
+        echo "  git submodule update --init --recursive" >&2
+        exit 1
+    fi
+done
+
+# The shared Wayland client. The protocol XML and the toplevel source used to
+# live here; they moved so lucid-panel could use one implementation rather than
+# a second copy that would drift.
+make -C third_party/lucid-wayland
 
 if ! pkg-config --exists gtk4; then
     echo "Missing GTK4 development files. Install: sudo apt install libgtk-4-dev" >&2
@@ -32,30 +39,17 @@ if ! pkg-config --exists gtk4-layer-shell-0; then
     exit 1
 fi
 
-# The two foreign-toplevel protocols the dock can use to see running windows.
-# The XML is vendored in protocols/ rather than taken from the system:
-# wlr-protocols is not packaged on Debian or Ubuntu at all, and pinning both
-# files means the marshalling code cannot change underneath a build.
+# The foreign-toplevel protocols, and the client that speaks them, now live in
+# third_party/lucid-wayland -- which generates and compiles the marshalling
+# itself, so this build no longer does. wayland-scanner is still required; the
+# submodule's Makefile calls it.
 if ! command -v wayland-scanner >/dev/null 2>&1; then
     echo "Missing wayland-scanner. Install: sudo apt install libwayland-bin" >&2
     exit 1
 fi
 
 mkdir -p generated
-for proto in ext-foreign-toplevel-list-v1 wlr-foreign-toplevel-management-unstable-v1; do
-    wayland-scanner client-header "protocols/$proto.xml" "generated/$proto-client-protocol.h"
-    wayland-scanner private-code   "protocols/$proto.xml" "generated/$proto-protocol.c"
-done
-
-# Compiled as C, not C++. The generated headers carry extern "C" guards, so the
-# C++ side links against them unchanged, and this avoids arguing with a C++
-# compiler about C sources nobody in this project wrote.
 proto_objs=""
-for proto in ext-foreign-toplevel-list-v1 wlr-foreign-toplevel-management-unstable-v1; do
-    gcc -std=c11 -O2 -c "generated/$proto-protocol.c" -o "generated/$proto-protocol.o" \
-        $(pkg-config --cflags wayland-client)
-    proto_objs="$proto_objs generated/$proto-protocol.o"
-done
 
 # gtk4-layer-shell must appear before libwayland on the link line: it works by
 # shimming libwayland, and linking it after produces a run-time failure rather
@@ -87,7 +81,9 @@ rm -f lucid_dock_cpp lucid_dock_settings
 echo "Building with gtk4-layer-shell-0 $(pkg-config --modversion gtk4-layer-shell-0)"
 g++ -std=c++20 -O2 -DHAVE_GTK4_LAYER_SHELL=1 -Igenerated -I. \
     -Ithird_party/lucid-tokens/include \
-    lucid_dock.cpp toplevel_source.cpp generated/build_stamp.cpp \
+    -Ithird_party/lucid-wayland/include \
+    lucid_dock.cpp generated/build_stamp.cpp \
+    third_party/lucid-wayland/liblucidwayland.a \
     third_party/lucid-tokens/src/tokens.cpp $proto_objs -o lucid_dock_cpp \
     $(pkg-config --cflags --libs gtk4-layer-shell-0 gtk4 gio-unix-2.0 wayland-client) \
     $rpath_flag ${LUCID_RPATH:+-Wl,-rpath,"$LUCID_RPATH"}

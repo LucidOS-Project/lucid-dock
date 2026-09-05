@@ -1,3 +1,6 @@
 [submodule "macoswebproto/third_party/lucid-tokens"]
 	path = macoswebproto/third_party/lucid-tokens
 	url = https://github.com/LucidOS-Project/lucid-tokens.git
+[submodule "macoswebproto/third_party/lucid-wayland"]
+	path = macoswebproto/third_party/lucid-wayland
+	url = https://github.com/LucidOS-Project/lucid-wayland.git

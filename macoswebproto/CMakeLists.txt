@@ -13,43 +13,32 @@ pkg_check_modules(GIO_UNIX REQUIRED IMPORTED_TARGET gio-unix-2.0)
 pkg_check_modules(WAYLAND_CLIENT REQUIRED IMPORTED_TARGET wayland-client)
 
 # ---------------------------------------------------------------------------
-# Foreign-toplevel protocols
+# lucid-wayland
 #
-# The XML is vendored in protocols/ rather than taken from wayland-protocols:
-# wlr-protocols is not packaged on Debian or Ubuntu at all, and pinning both
-# files means the marshalling code cannot change underneath a build.
+# The foreign-toplevel protocols and the client that speaks them used to be
+# generated and compiled here. They now live in third_party/lucid-wayland, so
+# that lucid-panel uses one implementation rather than a second copy that would
+# drift -- and protocol bugs are the hardest kind to find, because they look
+# like the compositor's fault.
 #
-# The generated sources are C. They are compiled as C -- the generated headers
-# carry extern "C" guards, so the C++ side links against them unchanged.
+# Built through its own Makefile rather than re-described in CMake: it already
+# knows how to run wayland-scanner and which sources are C, and restating that
+# here would be a second description of one build to keep in step.
 # ---------------------------------------------------------------------------
 
-find_program(WAYLAND_SCANNER wayland-scanner)
-if(NOT WAYLAND_SCANNER)
-	message(FATAL_ERROR "wayland-scanner not found. Install: sudo apt install libwayland-bin")
+set(LUCID_WAYLAND_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/lucid-wayland")
+if(NOT EXISTS "${LUCID_WAYLAND_DIR}/src/toplevel_source.cpp")
+	message(FATAL_ERROR
+		"third_party/lucid-wayland is empty. Run: git submodule update --init --recursive")
 endif()
 
-enable_language(C)
+set(LUCID_WAYLAND_LIB "${LUCID_WAYLAND_DIR}/liblucidwayland.a")
+add_custom_command(
+	OUTPUT "${LUCID_WAYLAND_LIB}"
+	COMMAND "${CMAKE_COMMAND}" -E env make -C "${LUCID_WAYLAND_DIR}"
+	VERBATIM)
+add_custom_target(lucid_wayland_lib DEPENDS "${LUCID_WAYLAND_LIB}")
 
-set(LUCID_PROTOCOL_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
-file(MAKE_DIRECTORY "${LUCID_PROTOCOL_DIR}")
-
-set(LUCID_PROTOCOL_SOURCES "")
-foreach(proto ext-foreign-toplevel-list-v1 wlr-foreign-toplevel-management-unstable-v1)
-	set(xml "${CMAKE_CURRENT_SOURCE_DIR}/protocols/${proto}.xml")
-	set(header "${LUCID_PROTOCOL_DIR}/${proto}-client-protocol.h")
-	set(code "${LUCID_PROTOCOL_DIR}/${proto}-protocol.c")
-	add_custom_command(
-		OUTPUT "${header}"
-		COMMAND "${WAYLAND_SCANNER}" client-header "${xml}" "${header}"
-		DEPENDS "${xml}"
-		VERBATIM)
-	add_custom_command(
-		OUTPUT "${code}"
-		COMMAND "${WAYLAND_SCANNER}" private-code "${xml}" "${code}"
-		DEPENDS "${xml}"
-		VERBATIM)
-	list(APPEND LUCID_PROTOCOL_SOURCES "${header}" "${code}")
-endforeach()
 
 # ---------------------------------------------------------------------------
 # Build stamp
@@ -102,12 +91,13 @@ if(NOT EXISTS "${LUCID_TOKENS_DIR}/src/tokens.cpp")
 		"Missing ${LUCID_TOKENS_DIR}. Run: git submodule update --init --recursive")
 endif()
 
-add_executable(lucid_dock_cpp lucid_dock.cpp toplevel_source.cpp "${LUCID_STAMP_CPP}"
-	"${LUCID_TOKENS_DIR}/src/tokens.cpp"
-	${LUCID_PROTOCOL_SOURCES})
-target_include_directories(lucid_dock_cpp PRIVATE "${LUCID_PROTOCOL_DIR}"
-	"${CMAKE_CURRENT_SOURCE_DIR}" "${LUCID_TOKENS_DIR}/include")
-add_dependencies(lucid_dock_cpp lucid_build_stamp)
+add_executable(lucid_dock_cpp lucid_dock.cpp "${LUCID_STAMP_CPP}"
+	"${LUCID_TOKENS_DIR}/src/tokens.cpp")
+target_include_directories(lucid_dock_cpp PRIVATE
+	"${CMAKE_CURRENT_SOURCE_DIR}" "${LUCID_TOKENS_DIR}/include"
+	"${LUCID_WAYLAND_DIR}/include")
+add_dependencies(lucid_dock_cpp lucid_build_stamp lucid_wayland_lib)
+target_link_libraries(lucid_dock_cpp PRIVATE "${LUCID_WAYLAND_LIB}")
 
 # gtk4-layer-shell has to precede libwayland on the link line -- it works by
 # shimming libwayland, and being linked after it fails at run time ("GTK4 Layer

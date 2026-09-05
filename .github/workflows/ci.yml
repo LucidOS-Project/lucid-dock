@@ -18,8 +18,9 @@ jobs:
       # backend, so they run the anchored path rather than the unanchored
       # fallback -- which is the path that ships, and which differs from the
       # fallback by about 35 MiB of RAM.
-      # libwayland-bin is wayland-scanner; the foreign-toplevel protocol XML is
-      # vendored, so wayland-protocols is deliberately not needed.
+      # libwayland-bin is wayland-scanner. The foreign-toplevel protocol XML is
+      # vendored in the lucid-wayland submodule, so wayland-protocols is
+      # deliberately not a build dependency.
       - name: Install build and test dependencies
         run: |
           sudo apt-get update

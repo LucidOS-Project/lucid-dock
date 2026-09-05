@@ -35,6 +35,22 @@ struct DesktopCatalogEntry {
     // gnome-text-editor.desktop reporting org.gnome.TextEditor, say. Often
     // absent, in which case the matcher falls back to the desktop file id.
     std::string startup_wm_class;
+
+    // The application's own menu entries, from the Desktop Entry spec's
+    // Actions= key: "New Window", "New Private Window", "Compose Message".
+    //
+    // These are the options an application publishes for itself, which is
+    // exactly what a dock's icon menu should offer -- and it is the reason that
+    // menu does not need a global menu bar to be useful. GTK4 removed exported
+    // application menus, so File/Edit/View cannot be had; Actions= is a
+    // different thing that still works, because it is data in a file rather
+    // than a live D-Bus export.
+    struct Action {
+        std::string id;      // the Actions= token
+        std::string name;    // display text
+        std::string exec;    // Exec line for this action
+    };
+    std::vector<Action> actions;
 };
 
 
@@ -163,6 +179,32 @@ inline bool load_desktop_info(const std::filesystem::path& desktop_path, Desktop
     entry.icon_name = icon_name.value_or("");
     entry.exec_line = exec_line.value_or("");
     entry.startup_wm_class = wm_class.value_or("");
+
+    // Actions=, and one group per action. An action whose group is missing or
+    // which has no Exec is skipped rather than shown as a menu item that does
+    // nothing -- a broken desktop file should cost its own entry, not the menu.
+    gsize action_count = 0;
+    gchar** action_ids = g_key_file_get_string_list(key_file, "Desktop Entry", "Actions",
+                                                    &action_count, nullptr);
+    for (gsize i = 0; action_ids != nullptr && i < action_count; ++i) {
+        const std::string id = action_ids[i];
+        if (id.empty()) {
+            continue;
+        }
+        const std::string group = "Desktop Action " + id;
+        if (!g_key_file_has_group(key_file, group.c_str())) {
+            continue;
+        }
+        gchar* action_name = g_key_file_get_locale_string(key_file, group.c_str(), "Name",
+                                                          nullptr, nullptr);
+        gchar* action_exec = g_key_file_get_string(key_file, group.c_str(), "Exec", nullptr);
+        if (action_name != nullptr && action_exec != nullptr && *action_exec != '\0') {
+            entry.actions.push_back({id, action_name, action_exec});
+        }
+        g_free(action_name);
+        g_free(action_exec);
+    }
+    g_strfreev(action_ids);
 
     g_key_file_unref(key_file);
     return true;

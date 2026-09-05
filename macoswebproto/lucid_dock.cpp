@@ -10,7 +10,7 @@
 #include <gio/gdesktopappinfo.h>
 
 #include "dock_config.h"
-#include "toplevel_source.h"
+#include "lucid/toplevel_source.h"
 #include "lucid/tokens.h"
 #include "build_stamp.h"
 
@@ -765,7 +765,14 @@ class DockEngine {
     }
 
     void start_toplevel_source() {
-        toplevel_source_ = lucid::make_toplevel_source([this]() { refresh_running_indicators(); });
+        // The dock offers Close on an icon's menu, which makes it a management
+        // client rather than a display-only one -- and ext-foreign-toplevel-
+        // list-v1 deliberately cannot manage, so asking moves the preference to
+        // wlr. Preferring ext was right while the dock only ever displayed.
+        lucid::ToplevelSourceNeeds needs;
+        needs.management = true;
+        toplevel_source_ =
+            lucid::make_toplevel_source([this]() { refresh_running_indicators(); }, needs);
         g_message("running-app detection: %s -- %s",
                   lucid::toplevel_source_token(toplevel_source_->kind()),
                   lucid::toplevel_source_description(toplevel_source_->kind()));
