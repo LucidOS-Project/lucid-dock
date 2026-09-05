@@ -607,6 +607,67 @@ written out a second time, so there is one place for them to be wrong.
 `.desktop` catalogue, and the functions that read and write them; a static
 library would be more build system than that is worth.
 
+## Nine of twelve icons were the generic one
+
+Only the three applications `Lucid` ships artwork for drew a Lucid icon. Chrome,
+VS Code, Extension Manager, System Monitor, Cubic, Claude, Calendar, Seahorse
+and Zorin Appearance all drew the same green gear. It looked like a theme with
+three icons in it. It was one argument:
+
+    const char* fallbacks[] = {"application-x-executable", nullptr};
+
+`gtk_icon_theme_lookup_icon()`'s fallback list does **not** mean "try these if
+the name is not found". GTK loops over the *themes* on the outside and the names
+on the inside, so every name is tried in one theme before any name is tried in
+the theme it inherits from -- and a fallback the first theme happens to own
+beats the real name in the theme underneath. `Lucid` ships
+`application-x-executable`; `google-chrome` lives one link down the chain, in
+`Lucid-Everything`. So the fallback won, every time, for every application
+whose artwork is not in `Lucid` itself.
+
+Measured against GTK 4.14.5 both ways, on the dock's own pinned set:
+
+| Icon name | with the fallback list | without it |
+|---|---|---|
+| `google-chrome` | `Lucid/512x512/mimetypes/application-x-executable.png` | `Lucid-Everything/apps/scalable/google-chrome.svg` |
+| `vscode` | the same generic icon | `Lucid-Everything/apps/scalable/vscode.svg` |
+| `zorin-appearance` | the same generic icon | `Lucid-Everything/apps/scalable/zorin-appearance.svg` |
+| `org.gnome.Calendar` | the same generic icon | `hicolor/scalable/apps/org.gnome.Calendar.svg` |
+| `org.gnome.Nautilus` | `Lucid/128x128/apps/org.gnome.Nautilus.png` | unchanged -- `Lucid` has it |
+| | **9 of 12 generic** | **0 of 12** |
+
+The three that were right were right *because* `Lucid` has their artwork: the
+real name won inside the first theme, before the fallback was reached. That is
+exactly why this read as a missing-artwork problem rather than a lookup bug.
+
+**It cannot be fixed by testing the result for null.** A GTK4 lookup that finds
+nothing does not fail -- it returns a paintable for `image-missing`, backed by a
+`resource://` URI with no file path. So the generic icon is now chosen by the
+dock rather than by GTK: `gtk_icon_theme_has_icon()` is asked first, and only
+when it says no is `application-x-executable` looked up instead. Verified that
+`has_icon()` and the no-fallback lookup agree on every name in the set,
+including `python3` -- which is in no theme at all and resolves to
+`/usr/share/pixmaps/python3.xpm`, so the check covers the unthemed directories
+as well as the inherit chain.
+
+Exercised end to end, under headless sway, with a desktop entry naming an icon
+that exists nowhere:
+
+    icon lucid-miss-test.desktop  'definitely-not-an-icon-xyzzy' is in no theme
+    on the search path -- using application-x-executable
+
+`LUCID_DOCK_ICONS=1` prints that line now, because "this fell back to the
+generic icon" and "this resolved" were previously indistinguishable in the log.
+Both printed the file that won, and the file that won said nothing about which
+name had asked for it.
+
+One consequence worth stating, since it changes what the ink normaliser is fed:
+the icons that were resolving to a 512 px PNG now resolve to SVGs in
+`Lucid-Everything`, which go through `GdkPixbuf` the same way and are measured
+and scaled the same way -- `google-chrome` ink 0.828 -> 0.900, x1.088. Nothing
+in the normalisation path needed to change, and a screenshot of the anchored
+path under headless sway confirms twelve distinct icons where there were three.
+
 ## Icons are not drawn to a common grid
 
 They arrive from whichever theme answers the lookup, and the answers do not

@@ -2244,16 +2244,47 @@ class DockEngine {
             g_object_unref(file);
         } else {
             GtkIconTheme* theme = lookup_theme();
-            {
-                const char* fallbacks[] = {"application-x-executable", nullptr};
-                paintable = gtk_icon_theme_lookup_icon(
-                    theme,
-                    icon.resolved_icon_name.c_str(),
-                    fallbacks,
-                    icon_source_size(),
-                    scale,
-                    GTK_TEXT_DIR_NONE,
-                    GTK_ICON_LOOKUP_FORCE_REGULAR);
+            // The generic icon is chosen here rather than handed to GTK as a
+            // fallback list, and that is the difference between a dock of real
+            // icons and a dock of gears.
+            //
+            // gtk_icon_theme_lookup_icon()'s fallbacks do not mean "try these
+            // if the name is not found". GTK loops over the *themes* on the
+            // outside and the names on the inside, so every name is tried in
+            // one theme before any name is tried in the theme it inherits
+            // from -- and a fallback the first theme happens to own beats the
+            // real name in the theme underneath. Lucid ships
+            // application-x-executable and inherits google-chrome from
+            // Lucid-Everything, so with a fallback list every application
+            // without a Lucid icon of its own resolved to the generic one:
+            //
+            //   google-chrome, fallbacks -> Lucid/512x512/mimetypes/application-x-executable.png
+            //   google-chrome, none      -> Lucid-Everything/apps/scalable/google-chrome.svg
+            //
+            // Asking has_icon() first exhausts the inherit chain before the
+            // generic icon is considered at all. It cannot be replaced by
+            // testing the returned paintable: a lookup that finds nothing does
+            // not return null, it returns GTK's own image-missing.
+            const bool themed =
+                theme != nullptr &&
+                gtk_icon_theme_has_icon(theme, icon.resolved_icon_name.c_str());
+            const char* looked_up =
+                themed ? icon.resolved_icon_name.c_str() : "application-x-executable";
+            paintable = gtk_icon_theme_lookup_icon(
+                theme,
+                looked_up,
+                nullptr,
+                icon_source_size(),
+                scale,
+                GTK_TEXT_DIR_NONE,
+                GTK_ICON_LOOKUP_FORCE_REGULAR);
+            if (!themed) {
+                static const bool trace = g_getenv("LUCID_DOCK_ICONS") != nullptr;
+                if (trace) {
+                    g_message("icon %-34s '%s' is in no theme on the search path -- "
+                              "using application-x-executable",
+                              icon.desktop_id.c_str(), icon.resolved_icon_name.c_str());
+                }
             }
         }
 
