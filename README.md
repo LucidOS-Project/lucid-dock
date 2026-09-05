@@ -997,6 +997,17 @@ of processes mapping them and is the only figure that adds up across a session.
 The dock's RSS is about 130 MiB; that number is not wrong, it just cannot be
 added to anything.
 
+**The last sample, not the highest.** The peak is the wrong statistic for a
+resting cost. The 300 ms entrance slide relayouts every frame and spikes
+allocation while it runs; on a slow runner that spike lands inside the sampling
+window, and on a faster machine it has finished before sampling starts. That
+difference alone reported one commit as 20.7 MiB locally and 36.8 MiB on CI --
+an apparent doubling that was entirely about when the samples were taken. The
+last sample is not the weaker check: anything retained or leaked is still there
+at the end and is caught either way, and only transients are excluded. The peak
+is printed alongside, so a large gap between the two is visible rather than
+silently dropped.
+
 This is a regression signal, not what a user pays. The shipped GL path costs
 about 44 MiB PSS on a machine with a GPU.
 

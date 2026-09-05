@@ -109,9 +109,20 @@ pss_of() {
 }
 
 # Runs one binary under its own headless compositor and reports steady-state
-# PSS. Sampled late and repeatedly: memory climbs for the first few seconds as
-# icons are rasterised and the first frames are drawn, and a number taken
-# before it settles is not the number a user lives with.
+# PSS: the LAST sample, not the highest.
+#
+# It took the peak first, and the peak is the wrong statistic for a resting
+# cost. The dock's 300 ms entrance slide relayouts every frame, which spikes
+# allocation while it runs, and on a slow runner that spike lands inside the
+# sampling window while on a faster machine it has finished before sampling
+# starts. That difference alone reported the same commit as 20.7 MiB here and
+# 36.8 MiB on CI -- a doubling that was entirely an artefact of when the
+# samples were taken.
+#
+# The last sample is not a weaker check than the peak. Anything that leaks or
+# is retained is still there at the end, so it is caught either way; only
+# transients are excluded, which is the intent. The peak is still printed, so a
+# large gap between the two is visible rather than silently discarded.
 measure() {
     local binary="$1" procname="$2" peak=0 sample
     # A fixture of its own: eight synthetic applications with stock Adwaita
@@ -229,16 +240,21 @@ EOF
         return 1
     fi
 
-    for _ in 1 2 3 4 5 6 7 8; do
+    local last=0
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
         sleep 1
         sample=$(pss_of "$pid")
-        [ -n "$sample" ] && peak=$(echo "$peak $sample" | awk '{print ($2>$1)?$2:$1}')
+        if [ -n "$sample" ]; then
+            last=$sample
+            peak=$(echo "$peak $sample" | awk '{print ($2>$1)?$2:$1}')
+        fi
     done
+    printf "  %-34s %8s MiB PSS (peak %s)\n" "$procname settled at" "$last" "$peak" >&2
 
     kill "$pid" 2>/dev/null
     kill "$SWAY_PID" 2>/dev/null; wait "$SWAY_PID" 2>/dev/null; SWAY_PID=""
     sleep 1
-    echo "$peak"
+    echo "$last"
 }
 
 echo "Measuring under headless sway, GSK_RENDERER=cairo (driver excluded)..."
