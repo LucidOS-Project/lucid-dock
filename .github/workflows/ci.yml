@@ -201,3 +201,103 @@ jobs:
           path: |
             macoswebproto/build/ci/CMakeFiles/*.log
           if-no-files-found: ignore
+
+  # The .deb that can actually be published.
+  #
+  # The job above builds the package on 24.04, where gtk4-layer-shell is not in
+  # the archive at all: it is built into ~/.local, LUCID_DEV_LIBDIR is set, and
+  # dh_shlibdeps is told to ignore the missing package info. The artifact that
+  # comes out records no dependency on layer-shell -- and debian/rules says so
+  # out loud, because that .deb installs cleanly and then does not start:
+  #
+  #     libgtk4-layer-shell.so.0: cannot open shared object file
+  #
+  # So every package this project had produced was unpublishable, correctly
+  # labelled, and never built any other way. 26.04 is the shipping target and
+  # has libgtk4-layer-shell-dev 1.3.0-1 in universe, so here the library is a
+  # real package, dpkg-shlibdeps resolves it to one, and ${shlibs:Depends}
+  # comes out complete. Nothing sets LUCID_DEV_LIBDIR in this job, and nothing
+  # should.
+  #
+  # The 26.04 runner image is in preview. If this job fails to *start* rather
+  # than failing to build, check whether the ubuntu-26.04 label still exists
+  # before looking at anything here.
+  release-package:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # Deliberately no source build of gtk4-layer-shell. Installing it from
+      # the archive is the entire point of running on the target: it is what
+      # makes the dependency resolvable, and therefore recordable.
+      - name: Install build dependencies from the archive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config cmake dpkg-dev debhelper \
+            libgtk-4-dev libglib2.0-dev libwayland-dev libwayland-bin \
+            libgtk4-layer-shell-dev
+
+      # No -d, unlike the development build. That flag skips the build
+      # dependency check, which 24.04 needs because it cannot satisfy one of
+      # them. Here it can, so letting dpkg-buildpackage check debian/control
+      # against a real archive is coverage the other job cannot give.
+      - name: Build the Debian package
+        run: |
+          dpkg-buildpackage -us -uc -b
+          mkdir -p dist
+          mv ../lucid-dock_*.deb ../lucid-dock_*.buildinfo ../lucid-dock_*.changes dist/
+          ls -la dist
+
+      # What a pass has to mean, rather than that dpkg-buildpackage exited 0.
+      # Both of the first two were false for every .deb this project has built.
+      - name: The package must be installable and runnable
+        run: |
+          deb=$(ls dist/lucid-dock_*.deb)
+          dpkg-deb -I "$deb"
+
+          # 1. The dependency is recorded. Without it the package installs
+          #    cleanly and the binary then refuses to start, which is the
+          #    worst available failure mode: apt reports success.
+          if ! dpkg-deb -f "$deb" Depends | grep -q 'layer-shell'; then
+            echo "no gtk4-layer-shell dependency in Depends:"
+            dpkg-deb -f "$deb" Depends
+            exit 1
+          fi
+
+          # 2. Every library resolves with nothing from this build on the path.
+          #    LD_LIBRARY_PATH is cleared rather than inherited: inheriting it
+          #    is exactly how a binary that only runs on its build machine
+          #    passes a check like this one.
+          dpkg-deb -x "$deb" /tmp/relroot
+          if env -u LD_LIBRARY_PATH ldd /tmp/relroot/usr/bin/lucid-dock | grep 'not found'; then
+            echo "the packaged binary has unresolved libraries"
+            exit 1
+          fi
+
+          # 3. And no rpath, for the same reason the development build checks
+          #    it: a path into a build machine's home directory is meaningless
+          #    on a user's system, and Debian policy forbids one pointing
+          #    outside the package.
+          if objdump -x /tmp/relroot/usr/bin/lucid-dock | grep -E 'RUNPATH|RPATH'; then
+            echo "the packaged binary carries an rpath"
+            exit 1
+          fi
+
+      # Installed for real, from the package, resolving its dependencies
+      # through apt -- then asked to speak. --version returns before GTK is
+      # initialised, so this needs no display and still proves the shipped
+      # binary starts on a machine that has only what the package asked for.
+      - name: Install it and run it
+        run: |
+          sudo apt-get install -y ./dist/lucid-dock_*.deb
+          lucid-dock --version
+
+      - name: Upload the publishable package
+        uses: actions/upload-artifact@v4
+        with:
+          name: lucid-dock-deb-release
+          path: dist/
+          if-no-files-found: error

@@ -1466,6 +1466,60 @@ concluding that the toolkit is the problem -- for reference, `foot`, a lean
 Wayland terminal in C, measures 10.6 MiB, so leaving GTK entirely would save
 roughly 35 MiB per surface.
 
+## The package is built twice, and only one of them can be published
+
+Every `.deb` this project had produced would install cleanly and then fail to
+start:
+
+    libgtk4-layer-shell.so.0: cannot open shared object file
+
+Not a packaging bug -- `debian/rules` already handles this and prints *"Do not
+publish this .deb"* when `LUCID_DEV_LIBDIR` is set. The problem was that the
+only build path set it. CI runs on `ubuntu-24.04`, where gtk4-layer-shell is
+not in the archive at all, so the workflow builds it into `~/.local`, takes the
+documented escape hatch, and `dh_shlibdeps` records no dependency because no
+package owns the library. Correct behaviour, correctly labelled, and the only
+kind of package that existed.
+
+    Depends: libc6, libcairo2, libgcc-s1, libgdk-pixbuf-2.0-0,
+             libglib2.0-0t64, libgtk-4-1, libstdc++6, libwayland-client0
+    RUNPATH: none
+    ldd:     libgtk4-layer-shell.so.0 => not found
+
+So there are two jobs. `build-and-test` on 24.04 still builds the package on
+every push, because `debian/control`, `debian/rules` and the install layout are
+the same on both and the day of a release is the worst day to discover they
+have rotted. `release-package` builds it on `ubuntu-26.04`, the shipping
+target, where `libgtk4-layer-shell-dev` is a real archive package -- so
+`dpkg-shlibdeps` resolves the library to a package and `${shlibs:Depends}`
+comes out complete. Nothing sets `LUCID_DEV_LIBDIR` there.
+
+It also drops the `-d` that the 24.04 build needs. That flag skips the
+build-dependency check; on the target the dependencies can actually be
+satisfied, so letting `dpkg-buildpackage` check `debian/control` against a real
+archive is coverage the other job cannot give.
+
+**The job asserts what a pass has to mean**, in the same spirit as the memory
+budget and the supervised-session check:
+
+| | |
+|---|---|
+| `Depends:` names a layer-shell package | without it, `apt` reports success and the binary does not start |
+| `ldd` resolves everything with `LD_LIBRARY_PATH` cleared | inheriting it is how a binary that runs only on its build machine passes this |
+| no `RUNPATH` | a path into a build machine's home directory is meaningless on a user's system |
+| `apt install ./lucid-dock_*.deb && lucid-dock --version` | installed for real, dependencies resolved by apt, then asked to speak |
+
+The last one works headless because `--version` returns before GTK is
+initialised.
+
+All three assertions were run against the existing development `.deb` before
+being committed, and the first two fail on it -- independently, each on its
+own. A gate that has never rejected anything is not known to be a gate.
+
+The 26.04 runner image is in preview. If that job fails to *start* rather than
+failing to build, check whether the `ubuntu-26.04` label still exists before
+looking at anything else.
+
 ## Enabling the supervised session check
 
 CI's last step runs `lucid-session` supervising this dock under headless sway --
