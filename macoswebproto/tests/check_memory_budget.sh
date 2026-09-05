@@ -160,7 +160,7 @@ EOF
     # that was being asked about.
     cat > "$WORK/sway.cfg" <<EOF
 output HEADLESS-1 resolution 1920x323
-exec_always env XDG_CONFIG_HOME=$WORK/config XDG_DATA_HOME=$WORK/data XDG_DATA_DIRS=$WORK/data:/usr/share GSK_RENDERER=cairo $binary > $WORK/$procname.log 2>&1
+exec_always env XDG_CONFIG_HOME=$WORK/config XDG_DATA_HOME=$WORK/data XDG_DATA_DIRS=$WORK/data:/usr/share GSK_RENDERER=cairo LUCID_DOCK_RUNNING=1 $binary > $WORK/$procname.log 2>&1
 EOF
     WLR_BACKENDS=headless sway -c "$WORK/sway.cfg" > "$WORK/sway.log" 2>&1 &
     SWAY_PID=$!
@@ -193,6 +193,28 @@ echo "Measuring under headless sway, GSK_RENDERER=cairo (driver excluded)..."
 floor=$(measure "$WORK/floor" floor) || exit 1
 dock=$(measure "$PWD/lucid_dock_cpp" lucid_dock_cpp) || exit 1
 
+# Did the dock actually draw the fixture? Checked rather than assumed,
+# because the failure it catches looks exactly like good news: a dock that
+# found no applications draws no icons, costs almost nothing, and sails
+# under any budget. CI reported 0.0 MiB that way once already.
+EXPECTED_ICONS=8
+# Distinct ids, not line count: the running-state dump is printed again on
+# every change, so counting lines counts the same icon several times. The
+# lines carry a "** Message: HH:MM:SS:" prefix, so this must not anchor at
+# the start of the line -- doing so matched nothing and reported 0 icons
+# for a dock that was plainly drawing eight.
+built=$(grep -oE "lucid-memtest-[0-9]+\.desktop" "$WORK/lucid_dock_cpp.log" 2>/dev/null | sort -u | wc -l)
+[ -z "$built" ] && built=0
+if [ "$built" -lt "$EXPECTED_ICONS" ]; then
+    echo
+    echo "FAIL: the dock built $built of $EXPECTED_ICONS fixture icons." >&2
+    echo "The measurement below would be of a dock that is not showing what it" >&2
+    echo "was given, so it is not a measurement of the dock. Its log:" >&2
+    sed "s/^/    /" "$WORK/lucid_dock_cpp.log" >&2
+    exit 1
+fi
+echo "  fixture: the dock built $built of $EXPECTED_ICONS pinned icons"
+
 delta=$(echo "$dock $floor" | awk '{printf "%.1f", $1-$2}')
 over=$(echo "$delta $BUDGET_MIB" | awk '{print ($1 > $2) ? "yes" : "no"}')
 
@@ -207,6 +229,8 @@ if [ "$implausible" = "yes" ]; then
     printf "  %-34s %8s MiB PSS\n" "lucid_dock_cpp" "$dock"
     printf "  %-34s %8s MiB\n"     "the dock's own cost" "$delta"
     echo
+    echo "The dock's log:" >&2
+    sed "s/^/    /" "$WORK/lucid_dock_cpp.log" >&2
     echo "FAIL: the dock measured $delta MiB above an empty GTK4 window." >&2
     echo "That is not plausible -- the dock cannot cost less than the window it" >&2
     echo "draws into -- so the measurement is broken rather than the dock being" >&2
