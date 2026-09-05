@@ -934,6 +934,27 @@ an unsaved-changes dialog, the dot stays lit until the compositor says the
 window is gone, and there is deliberately no forced kill. A dock that could
 destroy an unsaved document from a context menu would be a worse dock.
 
+**The dock stays magnified while an icon's menu is open.** Opening a popover
+takes a pointer grab, so GTK sends `leave` -- and leaving clears
+`current_mouse_x_`, which drops the envelope target to 0 and shrank the dock out
+from under the menu that had just been opened on it. macOS keeps the icon
+magnified for as long as its menu is up, and it is right to: the menu belongs to
+the icon being pointed at, and an icon that shrinks away the instant you ask it
+a question reads as the dock losing interest.
+
+So the pointer position is pinned while the menu is open, and the leave that the
+grab generates is ignored -- it is not the pointer leaving the dock, it is the
+pointer being taken away. On close the pin is dropped and `current_mouse_x_` is
+deliberately *left* where it was: if the pointer is still on the icon the dock
+stays magnified, which is correct, and if it is not, the crossing event the grab
+release produces corrects it a frame later. Clearing it there would shrink the
+dock for one frame every time a menu closed over an icon the pointer had never
+left.
+
+The dock's own background menu still collapses the dock, and that is left alone
+for now -- there is no icon under the pointer to keep magnified, so there is
+nothing being shrunk out from under anything.
+
 **The dock's own menu keeps the background.** The dock gesture is on
 `root_fixed_` in the `CAPTURE` phase, so it sees the press before any icon does;
 it now declines when the press is over an icon rather than claiming it. Where an

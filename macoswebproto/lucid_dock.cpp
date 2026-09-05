@@ -1293,6 +1293,12 @@ class DockEngine {
         auto* self = static_cast<DockEngine*>(user_data);
 
         if (!self->pointer_is_on_panel(x, y)) {
+            // An open icon menu holds the magnification where it was. Motion
+            // over the popover itself is off the panel by every measure, and
+            // acting on it would shrink the dock while its own menu is up.
+            if (self->menu_pin_x_.has_value()) {
+                return;
+            }
             // Off the panel is off the dock, even though it is still inside the
             // window. Same effect as leaving.
             if (self->current_mouse_x_.has_value() || self->hovered_index_.has_value()) {
@@ -1315,6 +1321,12 @@ class DockEngine {
 
     static void on_leave_static(GtkEventControllerMotion*, gpointer user_data) {
         auto* self = static_cast<DockEngine*>(user_data);
+        // The leave that opening a popover generates is not the pointer
+        // leaving the dock, it is the pointer being taken away by a grab. The
+        // dock must not react to it or it shrinks under its own menu.
+        if (self->menu_pin_x_.has_value()) {
+            return;
+        }
         self->current_mouse_x_.reset();
         self->hovered_index_.reset();
         self->queue_layout();
@@ -2950,10 +2962,31 @@ class DockEngine {
         gtk_widget_set_halign(icon_menu_, GTK_ALIGN_START);
         gtk_widget_set_parent(icon_menu_, root_fixed_);
 
+        // Held before the popup, because popping up is what generates the
+        // leave that would otherwise shrink the dock.
+        menu_pin_x_ = x;
+        current_mouse_x_ = x;
+        hovered_index_ = index;
+        g_signal_connect(icon_menu_, "closed",
+                         G_CALLBACK(&DockEngine::on_icon_menu_closed_static), this);
+
         const GdkRectangle at{static_cast<int>(x), static_cast<int>(y), 1, 1};
         gtk_popover_set_pointing_to(GTK_POPOVER(icon_menu_), &at);
         gtk_popover_popup(GTK_POPOVER(icon_menu_));
+        queue_layout();
         return true;
+    }
+
+    static void on_icon_menu_closed_static(GtkPopover*, gpointer user_data) {
+        auto* self = static_cast<DockEngine*>(user_data);
+        self->menu_pin_x_.reset();
+        // current_mouse_x_ is deliberately left where it was. If the pointer is
+        // still on the icon the dock stays magnified, which is what it should
+        // do; if it is not, the leave or motion event that the grab release
+        // produces corrects it a frame later. Clearing it here would shrink the
+        // dock for one frame every time a menu closed over an icon the pointer
+        // never left.
+        self->queue_layout();
     }
 
     static void on_icon_action_static(GSimpleAction*, GVariant* parameter, gpointer user_data) {
@@ -3449,6 +3482,15 @@ window {
     // flat and then easing nothing.
     std::optional<double> last_pointer_x_;
     GtkWidget* icon_menu_ = nullptr;
+    // Set while an icon's menu is open, to the pointer position that opened it.
+    //
+    // Opening a popover takes a pointer grab, so GTK sends leave -- and leaving
+    // clears current_mouse_x_, which drops the envelope target to 0 and shrinks
+    // the dock out from under the menu that was just opened on it. macOS keeps
+    // the icon magnified for as long as its menu is up, and it is right to: the
+    // menu belongs to the icon you are pointing at, and an icon that shrinks
+    // away the instant you ask it a question reads as the dock losing interest.
+    std::optional<double> menu_pin_x_;
     double envelope_ = 0.0;
     double envelope_velocity_ = 0.0;
 
