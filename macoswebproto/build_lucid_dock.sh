@@ -23,6 +23,31 @@ if ! pkg-config --exists gtk4-layer-shell-0; then
     exit 1
 fi
 
+# The two foreign-toplevel protocols the dock can use to see running windows.
+# The XML is vendored in protocols/ rather than taken from the system:
+# wlr-protocols is not packaged on Debian or Ubuntu at all, and pinning both
+# files means the marshalling code cannot change underneath a build.
+if ! command -v wayland-scanner >/dev/null 2>&1; then
+    echo "Missing wayland-scanner. Install: sudo apt install libwayland-bin" >&2
+    exit 1
+fi
+
+mkdir -p generated
+for proto in ext-foreign-toplevel-list-v1 wlr-foreign-toplevel-management-unstable-v1; do
+    wayland-scanner client-header "protocols/$proto.xml" "generated/$proto-client-protocol.h"
+    wayland-scanner private-code   "protocols/$proto.xml" "generated/$proto-protocol.c"
+done
+
+# Compiled as C, not C++. The generated headers carry extern "C" guards, so the
+# C++ side links against them unchanged, and this avoids arguing with a C++
+# compiler about C sources nobody in this project wrote.
+proto_objs=""
+for proto in ext-foreign-toplevel-list-v1 wlr-foreign-toplevel-management-unstable-v1; do
+    gcc -std=c11 -O2 -c "generated/$proto-protocol.c" -o "generated/$proto-protocol.o" \
+        $(pkg-config --cflags wayland-client)
+    proto_objs="$proto_objs generated/$proto-protocol.o"
+done
+
 # gtk4-layer-shell must appear before libwayland on the link line: it works by
 # shimming libwayland, and linking it after produces a run-time failure rather
 # than a link error.
@@ -52,8 +77,9 @@ GIT_DIRTY=""
 git diff --quiet 2>/dev/null || GIT_DIRTY="+dirty"
 
 echo "Building with gtk4-layer-shell-0 $(pkg-config --modversion gtk4-layer-shell-0)"
-g++ -std=c++20 -O2 -DHAVE_GTK4_LAYER_SHELL=1 lucid_dock.cpp -o lucid_dock_cpp \
-    $(pkg-config --cflags --libs gtk4-layer-shell-0 gtk4 gio-unix-2.0) \
+g++ -std=c++20 -O2 -DHAVE_GTK4_LAYER_SHELL=1 -Igenerated \
+    lucid_dock.cpp toplevel_source.cpp $proto_objs -o lucid_dock_cpp \
+    $(pkg-config --cflags --libs gtk4-layer-shell-0 gtk4 gio-unix-2.0 wayland-client) \
     -DLUCID_BUILD_STAMP="\"$BUILD_STAMP\"" -DLUCID_GIT_REV="\"$GIT_REV$GIT_DIRTY\"" \
     $rpath_flag ${LUCID_RPATH:+-Wl,-rpath,"$LUCID_RPATH"}
 echo "Built ./lucid_dock_cpp"

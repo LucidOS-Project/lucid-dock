@@ -1,5 +1,6 @@
 ._*
 build/
+generated/
 .DS_Store
 lucid_dock_cpp
 lucid_dock_settings

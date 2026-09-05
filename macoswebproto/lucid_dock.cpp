@@ -10,6 +10,7 @@
 #include <gio/gdesktopappinfo.h>
 
 #include "dock_config.h"
+#include "toplevel_source.h"
 
 #include <algorithm>
 #include <cctype>
@@ -160,7 +161,7 @@ struct DesktopApp {
     std::filesystem::path desktop_path;
     std::string icon_name;
     std::string exec_line;
-    std::vector<std::string> process_candidates;
+    std::vector<std::string> match_candidates;
     bool is_open = false;
     bool divider_before = false;
     // False for an application that is on the dock only because it is running.
@@ -178,7 +179,7 @@ struct IconRuntime {
     std::string title;
     std::filesystem::path desktop_path;
     std::string icon_name;
-    std::vector<std::string> process_candidates;
+    std::vector<std::string> match_candidates;
 
     double current_width = BASE_WIDTH;   // animated
     double width_velocity = 0.0;         // px/s, carried across frames by the spring
@@ -235,9 +236,12 @@ std::string to_lower_copy(std::string text) {
 
 
 
+// The binary names this desktop entry could be running as. Matched against
+// process names, so this is the /proc source's candidate list and nobody
+// else's.
 std::vector<std::string> exec_candidates(const std::string& exec_line, const std::string& desktop_id) {
     std::vector<std::string> candidates;
-    candidates.push_back(std::filesystem::path(desktop_id).stem().string());
+    candidates.push_back(lucid::normalise_match_key(std::filesystem::path(desktop_id).stem().string()));
 
     if (exec_line.empty()) {
         return candidates;
@@ -249,8 +253,8 @@ std::vector<std::string> exec_candidates(const std::string& exec_line, const std
     if (g_shell_parse_argv(exec_line.c_str(), &argc, &argv, &error)) {
         if (argc > 0 && argv != nullptr && argv[0] != nullptr) {
             const std::filesystem::path binary(argv[0]);
-            candidates.push_back(binary.filename().string());
-            candidates.push_back(binary.stem().string());
+            candidates.push_back(lucid::normalise_match_key(binary.filename().string()));
+            candidates.push_back(lucid::normalise_match_key(binary.stem().string()));
         }
         g_strfreev(argv);
     } else if (error != nullptr) {
@@ -262,7 +266,65 @@ std::vector<std::string> exec_candidates(const std::string& exec_line, const std
     return candidates;
 }
 
-std::unordered_set<std::string> collect_running_process_names();
+// The app_ids this desktop entry's windows could report. A different question
+// from exec_candidates(): an application's app_id and its binary name are
+// related only by convention, and for anything shipped as a Flatpak they are
+// routinely different.
+//
+// StartupWMClass is the spec's own answer and is treated as ground truth when
+// it is there. When it is not, the desktop file id is the convention almost
+// everything follows, and the trailing segment of a reverse-DNS id is the
+// common near-miss -- org.gnome.Nautilus.desktop for a window that says
+// "nautilus". That last one is a guess, so it is only made when StartupWMClass
+// has not already answered the question: two vendors' Calculator both reduce to
+// "calculator", and lighting up the wrong icon is worse than missing a dot.
+std::vector<std::string> window_match_candidates(const std::string& exec_line,
+                                                 const std::string& startup_wm_class,
+                                                 const std::string& desktop_id) {
+    std::vector<std::string> candidates;
+    const std::string stem = std::filesystem::path(desktop_id).stem().string();
+    candidates.push_back(lucid::normalise_match_key(stem));
+
+    if (!startup_wm_class.empty()) {
+        candidates.push_back(lucid::normalise_match_key(startup_wm_class));
+    } else {
+        const std::size_t dot = stem.rfind('.');
+        if (dot != std::string::npos && dot + 1 < stem.size()) {
+            candidates.push_back(lucid::normalise_match_key(stem.substr(dot + 1)));
+        }
+    }
+
+    // Plenty of applications simply report their binary name.
+    if (!exec_line.empty()) {
+        gint argc = 0;
+        gchar** argv = nullptr;
+        GError* error = nullptr;
+        if (g_shell_parse_argv(exec_line.c_str(), &argc, &argv, &error)) {
+            if (argc > 0 && argv != nullptr && argv[0] != nullptr) {
+                candidates.push_back(
+                    lucid::normalise_match_key(std::filesystem::path(argv[0]).stem().string()));
+            }
+            g_strfreev(argv);
+        } else if (error != nullptr) {
+            g_error_free(error);
+        }
+    }
+
+    std::sort(candidates.begin(), candidates.end());
+    candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+    return candidates;
+}
+
+// Which of the two a desktop entry needs depends on what is answering "is this
+// running?", and that is fixed for the life of the process.
+std::vector<std::string> match_candidates_for(const DesktopCatalogEntry& entry,
+                                              const std::string& desktop_id,
+                                              lucid::ToplevelSourceKind kind) {
+    if (kind == lucid::ToplevelSourceKind::Proc) {
+        return exec_candidates(entry.exec_line, desktop_id);
+    }
+    return window_match_candidates(entry.exec_line, entry.startup_wm_class, desktop_id);
+}
 
 // Icon lookup is GtkIconTheme's job. This used to walk
 // /usr/share/icons/Lucid-Light by hand across a fixed list of size
@@ -278,8 +340,9 @@ using CandidateCache = std::map<std::string, std::vector<std::string>>;
 
 std::vector<DesktopApp> load_dock_apps(const DockConfig& config,
                                        const std::map<std::string, DesktopCatalogEntry>& catalog,
-                                       const CandidateCache* cache = nullptr,
-                                       const std::unordered_set<std::string>* running = nullptr) {
+                                       lucid::ToplevelSourceKind source_kind,
+                                       const std::unordered_set<std::string>& running_names,
+                                       const CandidateCache* cache = nullptr) {
     // exec_candidates() is a pure function of the entry, so on the hot path it
     // comes from the cache the engine keeps beside the catalog.
     // Returns a reference on the cached path: this runs once per catalog entry
@@ -293,19 +356,10 @@ std::vector<DesktopApp> load_dock_apps(const DockConfig& config,
                 return it->second;
             }
         }
-        scratch = exec_candidates(entry.exec_line, desktop_id);
+        scratch = match_candidates_for(entry, desktop_id, source_kind);
         return scratch;
     };
     const auto& favorites = config.pinned;
-
-    // Scanning /proc costs ~11 ms. The caller usually has just done it, so it
-    // is passed in rather than repeated -- refresh_running_indicators() scanned
-    // /proc and then called this, which scanned it again, twice per tick.
-    std::unordered_set<std::string> scanned;
-    if (running == nullptr) {
-        scanned = collect_running_process_names();
-    }
-    const std::unordered_set<std::string>& running_names = running != nullptr ? *running : scanned;
 
     std::vector<DesktopApp> apps;
     apps.reserve(favorites.size());
@@ -334,7 +388,7 @@ std::vector<DesktopApp> load_dock_apps(const DockConfig& config,
             .desktop_path = entry.desktop_path,
             .icon_name = entry.icon_name,
             .exec_line = entry.exec_line,
-            .process_candidates = candidates,
+            .match_candidates = candidates,
             .is_open = is_open,
             .divider_before = divider_before,
             .pinned = true,
@@ -346,27 +400,21 @@ std::vector<DesktopApp> load_dock_apps(const DockConfig& config,
     }
 
     // Applications that are running but not pinned, appended behind a
-    // separator. Matching is by process name derived from the Exec line, which
-    // is a heuristic but a portable one: it needs nothing from the compositor
-    // and works identically on GNOME, KDE, sway and Hyprland.
-    //
-    // The better answer once LucidOS is on its own compositor is
-    // ext-foreign-toplevel-list-v1, which enumerates actual windows rather than
-    // guessing from processes. It reports what has a window instead of what has
-    // a process, so it does not miss Flatpak apps whose binary name differs
-    // from the desktop id, and does not show background daemons. Mutter does
-    // not implement it, but neither does it implement layer-shell, so on every
-    // compositor this dock can anchor to, the protocol is available.
+    // separator. What "running" means here depends on the source: an app_id
+    // reported by a window under the foreign-toplevel protocols, a process name
+    // derived from the Exec line under /proc. The second is a heuristic in both
+    // directions -- it shows D-Bus-activated services that have no window, and
+    // misses applications whose binary name does not resemble their desktop id.
     std::vector<std::string> pinned_ids(favorites.begin(), favorites.end());
-    std::unordered_set<std::string> seen_processes;
+    std::unordered_set<std::string> seen_keys;
     bool first_unpinned = true;
 
-    // A pinned icon already represents its process, so an unpinned entry that
-    // resolves to the same binary must not appear a second time.
+    // A pinned icon already represents its application, so an unpinned entry
+    // that resolves to the same key must not appear a second time.
     for (const auto& app : apps) {
-        for (const auto& candidate : app.process_candidates) {
+        for (const auto& candidate : app.match_candidates) {
             if (running_names.find(candidate) != running_names.end()) {
-                seen_processes.insert(candidate);
+                seen_keys.insert(candidate);
             }
         }
     }
@@ -388,11 +436,11 @@ std::vector<DesktopApp> load_dock_apps(const DockConfig& config,
             continue;
         }
 
-        // One process, one icon. Several desktop files can launch the same
-        // binary -- a KDE-specific variant beside the plain one, say -- and
-        // matching by process name finds all of them, so the dock would show
-        // System Monitor twice for a single running copy.
-        if (!seen_processes.insert(*match).second) {
+        // One application, one icon. Several desktop files can resolve to the
+        // same key -- a KDE-specific variant beside the plain one, say -- and
+        // matching finds all of them, so the dock would show System Monitor
+        // twice for a single running copy.
+        if (!seen_keys.insert(*match).second) {
             continue;
         }
 
@@ -402,7 +450,7 @@ std::vector<DesktopApp> load_dock_apps(const DockConfig& config,
             .desktop_path = entry.desktop_path,
             .icon_name = entry.icon_name,
             .exec_line = entry.exec_line,
-            .process_candidates = candidates,
+            .match_candidates = candidates,
             .is_open = true,
             .divider_before = first_unpinned,
             .pinned = false,
@@ -476,53 +524,6 @@ static double sine_in_out(double progress) {
     return -(std::cos(M_PI * progress) - 1.0) / 2.0;
 }
 
-std::unordered_set<std::string> collect_running_process_names() {
-    std::unordered_set<std::string> names;
-
-    const std::filesystem::path proc_root("/proc");
-    std::error_code ec;
-    for (const auto& entry : std::filesystem::directory_iterator(proc_root, ec)) {
-        if (ec) {
-            break;
-        }
-        if (!entry.is_directory(ec)) {
-            continue;
-        }
-
-        const std::string pid = entry.path().filename().string();
-        if (pid.empty() || !std::all_of(pid.begin(), pid.end(), [](unsigned char ch) {
-                return std::isdigit(ch) != 0;
-            })) {
-            continue;
-        }
-
-        const std::filesystem::path comm_path = entry.path() / "comm";
-        const std::filesystem::path cmdline_path = entry.path() / "cmdline";
-
-        {
-            std::ifstream comm(comm_path);
-            std::string name;
-            if (std::getline(comm, name) && !name.empty()) {
-                names.insert(name);
-            }
-        }
-
-        {
-            std::ifstream cmdline(cmdline_path, std::ios::binary);
-            std::string raw((std::istreambuf_iterator<char>(cmdline)), std::istreambuf_iterator<char>());
-            if (!raw.empty()) {
-                const std::size_t nul = raw.find('\0');
-                std::string first = raw.substr(0, nul);
-                if (!first.empty()) {
-                    names.insert(std::filesystem::path(first).filename().string());
-                }
-            }
-        }
-    }
-
-    return names;
-}
-
 class DockEngine {
   public:
     DockEngine() = default;
@@ -573,6 +574,25 @@ class DockEngine {
 
         gtk_widget_set_size_request(window_, pinned_width, window_height());
     }
+
+    // Established before anything reads the catalog, because which source is
+    // running decides what a desktop entry's match candidates even are.
+    //
+    // Printed unconditionally. "The dot is wrong" is three different bugs
+    // depending on the answer, and the answer is otherwise invisible from
+    // outside the process.
+    void start_toplevel_source() {
+        toplevel_source_ = lucid::make_toplevel_source([this]() { refresh_running_indicators(); });
+        g_message("running-app detection: %s -- %s",
+                  lucid::toplevel_source_token(toplevel_source_->kind()),
+                  lucid::toplevel_source_description(toplevel_source_->kind()));
+    }
+
+    const std::unordered_set<std::string>& running_keys() const {
+        return toplevel_source_->running_keys();
+    }
+
+    lucid::ToplevelSourceKind toplevel_source_kind() const { return toplevel_source_->kind(); }
 
         void build_ui(GtkApplication* app, const DockConfig& config,
                       const std::vector<DesktopApp>& dock_apps) {
@@ -700,7 +720,13 @@ class DockEngine {
 
         g_signal_connect(window_, "map", G_CALLBACK(&DockEngine::on_map_static), this);
 
-        running_refresh_id_ = g_timeout_add_seconds(4, &DockEngine::on_running_refresh_static, this);
+        // Only the /proc source needs a clock. Installing one anyway alongside
+        // an event-driven source would put back exactly the per-tick cost this
+        // replaces, and would do it invisibly.
+        if (!toplevel_source_->is_event_driven()) {
+            running_refresh_id_ =
+                g_timeout_add_seconds(4, &DockEngine::on_running_refresh_static, this);
+        }
         queue_layout();
 
         if (const char* bench = g_getenv("LUCID_DOCK_BENCH")) {
@@ -1686,7 +1712,7 @@ class DockEngine {
             icon.title = app.title;
             icon.desktop_path = app.desktop_path;
             icon.icon_name = app.icon_name;
-            icon.process_candidates = app.process_candidates;
+            icon.match_candidates = app.match_candidates;
             icon.is_open = app.is_open;
             icon.divider_before = app.divider_before;
 
@@ -1733,6 +1759,53 @@ class DockEngine {
                                    g_strdup(new_icon.desktop_id.c_str()), g_free);
             g_signal_connect(new_icon.button, "clicked",
                              G_CALLBACK(&DockEngine::on_icon_clicked_static), this);
+        }
+
+        log_running_state("after build");
+    }
+
+    // LUCID_DOCK_RUNNING=1: what the dock currently believes is running, and
+    // what it believed it from. Geometry got a printer for the same reason --
+    // this is state that decides what is drawn, does not show up in a
+    // screenshot, and has been wrong more than once.
+    //
+    // Printing the raw key set matters as much as the per-icon verdict: a
+    // missing dot is either "the application is not in the set" or "it is in
+    // the set under a name none of the candidates guessed", and those have
+    // completely different fixes.
+    void log_running_state(const char* when) {
+        if (g_getenv("LUCID_DOCK_RUNNING") == nullptr) {
+            return;
+        }
+        const auto& running = toplevel_source_->running_keys();
+        g_message("running state (%s) from '%s': %zu keys", when,
+                  lucid::toplevel_source_token(toplevel_source_->kind()), running.size());
+
+        // Only worth dumping for the window-based sources, where the set is
+        // one entry per open window. The /proc set is every process on the
+        // machine -- a few hundred entries, almost none of them an application
+        // -- and printing it buries the per-icon verdict underneath it.
+        if (toplevel_source_->is_event_driven()) {
+            std::vector<std::string> keys(running.begin(), running.end());
+            std::sort(keys.begin(), keys.end());
+            std::string joined;
+            for (const auto& key : keys) {
+                joined += key;
+                joined += ' ';
+            }
+            g_message("  keys: %s", joined.c_str());
+        }
+
+        for (const auto& icon : icons_) {
+            std::string matched = "-";
+            for (const auto& candidate : icon.match_candidates) {
+                if (running.find(candidate) != running.end()) {
+                    matched = candidate;
+                    break;
+                }
+            }
+            g_message("  %-44s %-8s via %s", icon.desktop_id.c_str(),
+                      icon.is_open ? "RUNNING" : "-", matched.c_str());
         }
     }
 
@@ -1908,45 +1981,61 @@ class DockEngine {
 
     void refresh_running_indicators() {
         ScopedWork timer(this, "refresh_running_indicators");
-        std::unordered_set<std::string> running;
         {
-            ScopedWork inner(this, "  collect_running_process_names");
-            running = collect_running_process_names();
+            // A no-op on the event-driven sources, where the set is already
+            // current; the /proc walk on the UI thread only happens here.
+            ScopedWork inner(this, "  toplevel_source refresh");
+            toplevel_source_->refresh();
         }
+        const std::unordered_set<std::string>& running = toplevel_source_->running_keys();
 
-        // Compare only the names the dock could possibly care about. The raw
-        // /proc set churns every few seconds -- short-lived helpers, workers,
-        // shells -- so comparing it wholesale almost never matches and the
-        // skip never fires. The set of *our* candidates that are running is
-        // stable, because it only changes when an application the dock can show
-        // starts or stops.
-        std::set<std::string> relevant;
-        ScopedWork relevant_timer(this, "  match relevant candidates");
-        for (const auto& [desktop_id, candidates] : candidates()) {
-            for (const auto& candidate : candidates) {
-                if (running.find(candidate) != running.end()) {
-                    relevant.insert(candidate);
-                    break;
+        // Has anything the dock could show actually changed?
+        //
+        // The polled path has to work this out for itself. The raw /proc set
+        // churns every few seconds -- short-lived helpers, workers, shells --
+        // so comparing it wholesale almost never matches and the skip never
+        // fires; the set of *our* candidates that are running is stable,
+        // because it only changes when an application the dock can show starts
+        // or stops. Establishing that walks the whole catalog and measured
+        // 3.7-8.7 ms on the UI thread.
+        //
+        // An event-driven source has already answered the question: its
+        // callback fires only when the set of app_ids changed, and it fires
+        // once per batch of Wayland events rather than once per event. Running
+        // the check anyway would move that cost from once every four seconds to
+        // once per window opened -- a dropped frame at exactly the moment the
+        // dock is animating a launch.
+        if (!toplevel_source_->is_event_driven()) {
+            std::set<std::string> relevant;
+            {
+                ScopedWork relevant_timer(this, "  match relevant candidates");
+                for (const auto& [desktop_id, candidates] : candidates()) {
+                    for (const auto& candidate : candidates) {
+                        if (running.find(candidate) != running.end()) {
+                            relevant.insert(candidate);
+                            break;
+                        }
+                    }
                 }
             }
-        }
-        if (relevant == last_relevant_) {
-            return;
-        }
-        if (g_getenv("LUCID_DOCK_TIMERS") != nullptr && !last_relevant_.empty()) {
-            std::string added, removed;
-            for (const auto& r : relevant) {
-                if (!last_relevant_.count(r)) { added += r; added += " "; }
+            if (relevant == last_relevant_) {
+                return;
             }
-            for (const auto& r : last_relevant_) {
-                if (!relevant.count(r)) { removed += r; removed += " "; }
+            if (g_getenv("LUCID_DOCK_TIMERS") != nullptr && !last_relevant_.empty()) {
+                std::string added, removed;
+                for (const auto& r : relevant) {
+                    if (!last_relevant_.count(r)) { added += r; added += " "; }
+                }
+                for (const auto& r : last_relevant_) {
+                    if (!relevant.count(r)) { removed += r; removed += " "; }
+                }
+                g_message("running set changed: +[%s] -[%s]", added.c_str(), removed.c_str());
             }
-            g_message("running set changed: +[%s] -[%s]", added.c_str(), removed.c_str());
+            last_relevant_ = std::move(relevant);
         }
-        last_relevant_ = std::move(relevant);
         for (auto& icon : icons_) {
             bool is_open = false;
-            for (const auto& name : icon.process_candidates) {
+            for (const auto& name : icon.match_candidates) {
                 if (running.find(name) != running.end()) {
                     is_open = true;
                     break;
@@ -1955,7 +2044,7 @@ class DockEngine {
             icon.is_open = is_open;
             gtk_widget_set_visible(icon.dot, is_open ? TRUE : FALSE);
 
-            // Appearing in the process list is what ends a launch. The bounce
+            // Appearing in the running set is what ends a launch. The bounce
             // stops at the end of its current cycle rather than mid-air.
             if (is_open) {
                 icon.launch_pending_since.reset();
@@ -1965,6 +2054,8 @@ class DockEngine {
         if (config_.show_running) {
             sync_running_items(running);
         }
+
+        log_running_state("after change");
     }
 
     // An application starting or quitting changes which icons exist, which is
@@ -1976,7 +2067,8 @@ class DockEngine {
         catalog_ = load_desktop_catalog();
         candidates_.clear();
         for (const auto& [desktop_id, entry] : catalog_) {
-            candidates_[desktop_id] = exec_candidates(entry.exec_line, desktop_id);
+            candidates_[desktop_id] =
+                match_candidates_for(entry, desktop_id, toplevel_source_->kind());
         }
     }
 
@@ -2000,7 +2092,8 @@ class DockEngine {
         std::vector<std::string> want;
         {
             ScopedWork inner(this, "  load_dock_apps");
-            for (const auto& app : load_dock_apps(config_, catalog(), &candidates_, &running)) {
+            for (const auto& app : load_dock_apps(config_, catalog(), toplevel_source_->kind(),
+                                                 running, &candidates_)) {
                 want.push_back(app.desktop_path.filename().string());
             }
         }
@@ -2057,7 +2150,14 @@ class DockEngine {
         return G_SOURCE_CONTINUE;
     }
 
+    // Under an event-driven source there is nothing to poll for: the toplevel
+    // arrives as an event and ends the bounce there. LAUNCH_TIMEOUT still
+    // applies, and is enforced from update_bounce() on the frame clock, which
+    // is already running because the icon is bouncing.
     void ensure_launch_poll() {
+        if (toplevel_source_->is_event_driven()) {
+            return;
+        }
         if (launch_poll_id_ == 0) {
             launch_poll_id_ = g_timeout_add(LAUNCH_POLL_MS,
                                             &DockEngine::on_launch_poll_static, this);
@@ -2286,7 +2386,8 @@ class DockEngine {
         icons_.clear();
         last_applied_pixel_widths_.clear();
 
-        build_icons(load_dock_apps(config_, catalog(), &candidates_));
+        build_icons(load_dock_apps(config_, catalog(), toplevel_source_->kind(),
+                                   toplevel_source_->running_keys(), &candidates_));
         last_icon_scale_ = 0;
     }
 
@@ -2482,6 +2583,10 @@ window {
 
     guint tick_id_ = 0;
     guint running_refresh_id_ = 0;
+
+    // Owns the Wayland connection when it is one of the protocol sources, so it
+    // outlives every callback that touches it and is torn down with the engine.
+    std::unique_ptr<lucid::ToplevelSource> toplevel_source_;
     bool layout_dirty_ = false;
     // True only when the compositor actually implements wlr-layer-shell.
     bool layer_shell_active_ = false;
@@ -2506,9 +2611,12 @@ window {
 
 void on_activate(GtkApplication* app, gpointer) {
     static DockEngine engine;
+    engine.start_toplevel_source();
     const auto catalog = load_desktop_catalog();
     const DockConfig config = ensure_config(catalog);
-    engine.build_ui(app, config, load_dock_apps(config, catalog));
+    engine.build_ui(app, config,
+                    load_dock_apps(config, catalog, engine.toplevel_source_kind(),
+                                   engine.running_keys()));
 }
 
 }  // namespace

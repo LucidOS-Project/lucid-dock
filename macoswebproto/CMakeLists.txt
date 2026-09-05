@@ -10,6 +10,46 @@ find_package(PkgConfig REQUIRED)
 
 pkg_check_modules(GTK4 REQUIRED IMPORTED_TARGET gtk4)
 pkg_check_modules(GIO_UNIX REQUIRED IMPORTED_TARGET gio-unix-2.0)
+pkg_check_modules(WAYLAND_CLIENT REQUIRED IMPORTED_TARGET wayland-client)
+
+# ---------------------------------------------------------------------------
+# Foreign-toplevel protocols
+#
+# The XML is vendored in protocols/ rather than taken from wayland-protocols:
+# wlr-protocols is not packaged on Debian or Ubuntu at all, and pinning both
+# files means the marshalling code cannot change underneath a build.
+#
+# The generated sources are C. They are compiled as C -- the generated headers
+# carry extern "C" guards, so the C++ side links against them unchanged.
+# ---------------------------------------------------------------------------
+
+find_program(WAYLAND_SCANNER wayland-scanner)
+if(NOT WAYLAND_SCANNER)
+	message(FATAL_ERROR "wayland-scanner not found. Install: sudo apt install libwayland-bin")
+endif()
+
+enable_language(C)
+
+set(LUCID_PROTOCOL_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+file(MAKE_DIRECTORY "${LUCID_PROTOCOL_DIR}")
+
+set(LUCID_PROTOCOL_SOURCES "")
+foreach(proto ext-foreign-toplevel-list-v1 wlr-foreign-toplevel-management-unstable-v1)
+	set(xml "${CMAKE_CURRENT_SOURCE_DIR}/protocols/${proto}.xml")
+	set(header "${LUCID_PROTOCOL_DIR}/${proto}-client-protocol.h")
+	set(code "${LUCID_PROTOCOL_DIR}/${proto}-protocol.c")
+	add_custom_command(
+		OUTPUT "${header}"
+		COMMAND "${WAYLAND_SCANNER}" client-header "${xml}" "${header}"
+		DEPENDS "${xml}"
+		VERBATIM)
+	add_custom_command(
+		OUTPUT "${code}"
+		COMMAND "${WAYLAND_SCANNER}" private-code "${xml}" "${code}"
+		DEPENDS "${xml}"
+		VERBATIM)
+	list(APPEND LUCID_PROTOCOL_SOURCES "${header}" "${code}")
+endforeach()
 
 # gtk4-layer-shell is REQUIRED by default. Without it the dock cannot anchor to
 # a screen edge and degrades to an unanchored, fixed-size window. That fallback
@@ -23,7 +63,8 @@ else()
 	pkg_check_modules(GTK4_LAYER_SHELL REQUIRED IMPORTED_TARGET gtk4-layer-shell-0)
 endif()
 
-add_executable(lucid_dock_cpp lucid_dock.cpp)
+add_executable(lucid_dock_cpp lucid_dock.cpp toplevel_source.cpp ${LUCID_PROTOCOL_SOURCES})
+target_include_directories(lucid_dock_cpp PRIVATE "${LUCID_PROTOCOL_DIR}")
 
 # gtk4-layer-shell has to precede libwayland on the link line -- it works by
 # shimming libwayland, and being linked after it fails at run time ("GTK4 Layer
@@ -45,7 +86,8 @@ else()
 		"which is the GTK3 build) and reconfigure.")
 endif()
 
-target_link_libraries(lucid_dock_cpp PRIVATE PkgConfig::GTK4 PkgConfig::GIO_UNIX)
+target_link_libraries(lucid_dock_cpp PRIVATE PkgConfig::GTK4 PkgConfig::GIO_UNIX
+	PkgConfig::WAYLAND_CLIENT)
 
 # The settings UI. Separate binary, shares dock_config.h, and deliberately does
 # not link layer-shell: it is an ordinary application window.

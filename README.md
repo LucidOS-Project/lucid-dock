@@ -11,6 +11,9 @@ LucidOS desktop is built around (see "Why out-of-process" below).
 |---|---|
 | `macoswebproto/lucid_dock.cpp` | Primary implementation (C++20, GTK4, layer-shell) |
 | `macoswebproto/dock_config.h` | Config + `.desktop` catalogue, shared by both binaries |
+| `macoswebproto/toplevel_source.{h,cpp}` | Which applications are running, and where that answer comes from |
+| `macoswebproto/protocols/` | Vendored Wayland protocol XML (the two foreign-toplevel protocols) |
+| `macoswebproto/tests/` | A fake compositor for the protocol no compositor here implements |
 | `macoswebproto/dock_settings_page.cpp` | The settings UI, as a widget |
 | `macoswebproto/lucid_dock_settings.cpp` | ~20 line wrapper making that widget a window |
 | `macoswebproto/lucid_dock.py` | Python implementation of the same design |
@@ -25,9 +28,16 @@ LucidOS desktop is built around (see "Why out-of-process" below).
     cmake -S . -B build && cmake --build build
     ./build/lucid_dock_cpp
 
-Requires `libgtk-4-dev`, `libglib2.0-dev` (for `gio-unix-2.0`) and
+Requires `libgtk-4-dev`, `libglib2.0-dev` (for `gio-unix-2.0`),
+`libwayland-dev` and `libwayland-bin` (for `wayland-scanner`), and
 **`gtk4-layer-shell`** (the GTK4 version — *not* `libgtk-layer-shell-dev`, which
 is the GTK3 one and will not work here).
+
+The two foreign-toplevel protocols are generated from XML vendored in
+`protocols/`, so `wayland-protocols` is not a build dependency. That is not
+tidiness: `wlr-protocols` is not packaged on Debian or Ubuntu at all, and
+pinning both files means the marshalling code cannot change underneath a build.
+See "Running applications".
 
 ### gtk4-layer-shell availability
 
@@ -85,6 +95,9 @@ implement that protocol and does **not** work on GNOME:
 | **GNOME / Mutter** | **No** | Mutter does not implement `wlr-layer-shell` and has consistently declined to |
 | X11 | No | Wayland only |
 
+A second protocol matters for a second reason -- see "Running applications"
+below. Neither is required to start; both change how well the dock works.
+
 Without layer-shell the dock degrades to a plain undecorated window that cannot
 anchor to the screen edge, cannot reserve space, and is positioned by guesswork.
 That fallback is a development convenience, not a supported mode. The choice is
@@ -103,6 +116,175 @@ inside it instead:
 That opens a window containing a real layer-shell compositor, with the dock
 anchored inside it. It is the only way to test the supported path short of
 logging into KWin or sway.
+
+## Running applications
+
+The dot under an icon, and the unpinned icons that appear behind a separator,
+both come from one question: which applications are running? There are three
+ways to answer it and the dock picks the best one available at startup.
+
+| Source | Protocol | How it updates | Reports |
+|---|---|---|---|
+| `ext` | `ext-foreign-toplevel-list-v1` | Event-driven | Windows |
+| `wlr` | `zwlr-foreign-toplevel-management-v1` | Event-driven | Windows |
+| `proc` | none | Polled, every 4 s | Processes |
+
+Which one is in use is printed at startup, because "the dot is wrong" is three
+different bugs depending on the answer:
+
+    running-app detection: wlr -- zwlr-foreign-toplevel-management-v1 (event-driven, windows)
+
+`LUCID_DOCK_TOPLEVEL_SOURCE=ext|wlr|proc` forces one. It names exactly one
+source and does not fall through to a better one, because the point of the
+variable is to reproduce a specific source's behaviour -- it does still fall
+back to `proc` if the named protocol is absent, since the alternative is no
+dock.
+
+### Why a process is the wrong thing to count
+
+The `proc` source walks `/proc`, collects process names, and matches them
+against names derived from each `.desktop` file's `Exec` line. It needs nothing
+from the compositor, which is its only virtue. It is wrong in both directions:
+it misses applications whose binary name does not resemble their desktop id,
+which is most Flatpaks, and it reports background services as running
+applications.
+
+The second one is not hypothetical. Three of the three dots showing on a stock
+Zorin session were wrong:
+
+| Desktop entry | `proc` says | Actual process | Windows |
+|---|---|---|---|
+| `org.gnome.Calendar.desktop` | RUNNING | `gnome-calendar --gapplication-service` | none |
+| `org.gnome.Software.desktop` | RUNNING | `gnome-software --gapplication-service` | none |
+| `org.gnome.Nautilus.desktop` | RUNNING | `nautilus --gapplication-service` | none |
+
+All three are D-Bus activated and sitting idle with nothing on screen. A dock
+that claims they are open is not reporting a subtle edge case, it is reporting
+the opposite of the truth.
+
+The foreign-toplevel protocols answer the question that was actually being
+asked. They enumerate toplevels -- windows -- so a service with no window is
+not running, and an application is matched by the `app_id` its window reports
+rather than by guessing at its binary name.
+
+### What it cost to ask the wrong question
+
+Measured on the machine in "Performance notes", with `LUCID_DOCK_TIMERS=1`:
+
+| | Cost on the UI thread |
+|---|---|
+| `proc`, per 4 s tick | **16.4 - 19.8 ms**, whether or not anything changed |
+| `ext`/`wlr`, nothing changed | 0 ms -- no timer exists |
+| `ext`/`wlr`, a window opened or closed | 1.9 - 2.8 ms |
+| `ext`/`wlr`, 2nd window of an app already running | 0 ms -- no callback at all |
+
+The first change after startup also pays a one-off 14-28 ms to load the
+`.desktop` catalogue, which is lazy and would otherwise have been paid by the
+first `/proc` tick. It is not a per-change cost and is not counted above.
+
+A frame at 60 Hz is 16.7 ms, so the polled path dropped a frame every four
+seconds, permanently, to recompute an answer that changes a few times an hour.
+
+Two separate things went away, and it is worth keeping them apart. The `/proc`
+walk itself was 16-20 ms. On top of that, `refresh_running_indicators()` walked
+the whole catalog to decide whether anything relevant had changed -- 3.7-8.7 ms
+-- because the raw `/proc` set churns constantly and comparing it wholesale
+never matches. **An event-driven source has already answered that question**:
+its callback fires only when the set of `app_ids` changed. That check is now
+skipped entirely on the event path, and kept on the polled one where it is still
+load-bearing.
+
+The last row is the reference counting. Two windows of one application hold one
+key between them, so opening a second Firefox window, or closing one of two,
+produces no dock work at all -- and, more importantly, does not put the dot out
+while a window is still open.
+
+### Matching a window to a desktop file
+
+`app_id` and desktop file id are related by convention, not by rule. The
+candidates for an entry are, in order of how much they are trusted:
+
+1. the desktop file id, less `.desktop` (`org.gnome.Nautilus`)
+2. `StartupWMClass`, which is the Desktop Entry spec's own answer to exactly
+   this question, and is treated as ground truth when present
+3. the trailing segment of a reverse-DNS id (`org.gnome.Nautilus` -> `nautilus`)
+4. the `Exec` line's binary name
+
+Everything is lower-cased on both sides. Step 3 is a guess and is **only made
+when `StartupWMClass` is absent**: two vendors' Calculator both reduce to
+`calculator`, and lighting up the wrong icon is worse than missing a dot. Where
+the desktop file has told us the answer, the dock does not guess as well.
+
+`StartupWMClass` was not previously parsed at all; `dock_config.h` now reads it.
+
+The `proc` source keeps its own, separate candidate list built from the `Exec`
+line, because a process name and an `app_id` are not interchangeable and mixing
+the two lists would invent matches that neither source justifies.
+
+### Seeing what it thinks
+
+    LUCID_DOCK_RUNNING=1 ./lucid_dock_cpp
+
+prints the running key set and a per-icon verdict at startup and on every
+change:
+
+    running state (after change) from 'wlr': 2 keys
+      keys: org.gnome.calculator org.gnome.texteditor
+      org.gnome.Calendar.desktop                   -        via -
+      org.gnome.Calculator.desktop                 RUNNING  via org.gnome.calculator
+
+Geometry got a printer for the same reason. This is state that decides what is
+drawn, does not show up in a screenshot, and has been wrong before. Printing
+the raw key set matters as much as the per-icon verdict: a missing dot is
+either "the application is not in the set" or "it is in the set under a name
+none of the candidates guessed", and those have completely different fixes.
+
+The key dump is suppressed for `proc`, where the set is every process on the
+machine rather than one entry per window.
+
+### Protocol availability, as measured rather than as documented
+
+Checked by binding the registry and listing globals, not by reading changelogs:
+
+| Session | `zwlr_layer_shell_v1` | `ext_foreign_toplevel_list_v1` | `zwlr_foreign_toplevel_manager_v1` |
+|---|---|---|---|
+| GNOME / Mutter 46 | no | no | no |
+| sway 1.9 (wlroots 0.17), Ubuntu 24.04 | v4 | **no** | v3 |
+| sway 1.10+ (wlroots 0.18+), KWin 6, Hyprland, COSMIC, niri | yes | yes | yes |
+
+`ext-foreign-toplevel-list-v1` is the standard and is what the dock prefers.
+It landed in wlroots 0.18, so it is **not** available on the newest sway Ubuntu
+24.04 packages -- which is the whole reason the `wlr` source exists rather than
+`ext` alone. `wlr` is also what KWin and Hyprland have had longest, so it is the
+wider net today and the one that will age out later.
+
+Note that Mutter implements neither of these and neither `wlr-layer-shell`, so
+on GNOME the dock cannot anchor *and* falls back to `proc`. Everywhere the dock
+can actually anchor, one of the two protocols is available.
+
+### Testing this
+
+The `wlr` path is testable for real, from a GNOME session:
+
+    WLR_BACKENDS=wayland sway -c <config that execs the dock>
+
+The `ext` path is not, on a 24.04-era host: nothing available implements it.
+`macoswebproto/tests/` therefore contains a compositor that implements
+`ext-foreign-toplevel-list-v1` and nothing else -- no surfaces, no seat, no
+rendering -- and plays a fixed script of toplevels at the dock's real
+`ToplevelSource`:
+
+    ./macoswebproto/tests/run_toplevel_source_tests.sh
+
+It covers initial enumeration on bind, a toplevel appearing later, two
+toplevels sharing an `app_id`, an `app_id` changed and committed with `done`,
+and `closed`. It asserts the whole sequence of states rather than grepping for
+individual events, so a missing event and a spurious one both fail.
+
+This is a stand-in for running against a real compositor, not a replacement for
+it. It proves the client speaks the protocol correctly; it cannot prove a real
+compositor sends what this one sends. Re-run the `wlr` scenario against a real
+`ext` compositor once one is available on the host.
 
 ## Configuration
 

@@ -28,6 +28,13 @@ struct DesktopCatalogEntry {
     std::string title;
     std::string icon_name;
     std::string exec_line;
+    // The Wayland app_id (or X11 WM_CLASS) the application is expected to
+    // report. This is the Desktop Entry spec's own answer to "which desktop
+    // file does this window belong to", and it is the only reliable link for
+    // an application whose app_id does not resemble its desktop file id --
+    // gnome-text-editor.desktop reporting org.gnome.TextEditor, say. Often
+    // absent, in which case the matcher falls back to the desktop file id.
+    std::string startup_wm_class;
 };
 
 
@@ -149,11 +156,13 @@ inline bool load_desktop_info(const std::filesystem::path& desktop_path, Desktop
     const auto title = load_keyfile_value(key_file, "Name");
     const auto icon_name = load_keyfile_value(key_file, "Icon");
     const auto exec_line = load_keyfile_value(key_file, "Exec");
+    const auto wm_class = load_keyfile_value(key_file, "StartupWMClass");
 
     entry.desktop_path = desktop_path;
     entry.title = title.value_or(desktop_path.stem().string());
     entry.icon_name = icon_name.value_or("");
     entry.exec_line = exec_line.value_or("");
+    entry.startup_wm_class = wm_class.value_or("");
 
     g_key_file_unref(key_file);
     return true;
