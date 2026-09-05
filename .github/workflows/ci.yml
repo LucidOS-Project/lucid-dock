@@ -84,6 +84,60 @@ jobs:
           mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
           ./tests/check_memory_budget.sh
 
+      # The composition, not the components. lucid-session supervising the real
+      # dock under a real layer-shell compositor is the claim the LucidOS session
+      # rests on, and neither repository's own suite tests it: lucid-session's
+      # fixtures are shell scripts, and the dock has never been started by
+      # anything but a person.
+      #
+      # lucid-session is private, so this needs a token with read access to it --
+      # the default GITHUB_TOKEN is scoped to this repository alone. Without the
+      # secret the step skips rather than failing, because a missing credential
+      # is not a broken dock and should not look like one.
+      - name: Supervised session (lucid-session + dock under sway)
+        env:
+          LUCID_SESSION_TOKEN: ${{ secrets.LUCID_SESSION_TOKEN }}
+        working-directory: macoswebproto
+        run: |
+          if [ -z "$LUCID_SESSION_TOKEN" ]; then
+            echo "::notice::LUCID_SESSION_TOKEN not set -- skipping the supervised"\
+                 "session check. Create a fine-grained PAT with read access to"\
+                 "LucidOS-Project/lucid-session and add it as that secret to enable."
+            exit 0
+          fi
+          git clone --depth 1 \
+            "https://x-access-token:$LUCID_SESSION_TOKEN@github.com/LucidOS-Project/lucid-session.git" \
+            /tmp/lucid-session
+          make -C /tmp/lucid-session
+
+          export XDG_RUNTIME_DIR=/tmp/xdg-session
+          mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
+
+          # A start shorter than lucid-session's healthy_seconds is a failure by
+          # definition, so the dock has to be left alone past it and then stopped
+          # the way a session ends -- by the compositor going away, not a kill.
+          cat > /tmp/sway.cfg <<EOF
+          output HEADLESS-1 resolution 1280x720
+          exec_always sh -c '(/tmp/lucid-session/lucid-session run $PWD/lucid_dock_cpp > /tmp/session.log 2>&1; echo "rc=\$?" >> /tmp/session.log) & sleep 16; swaymsg exit'
+          EOF
+          WLR_BACKENDS=headless WLR_RENDERER=pixman GSK_RENDERER=cairo \
+            LUCID_DOCK_NO_INTRO=1 sway -c /tmp/sway.cfg
+          cat /tmp/session.log
+
+          # The dock must have taken the anchored path and an event-driven
+          # toplevel source: falling back to proc here would mean the protocol
+          # went missing, and it would still have "worked".
+          grep -q "running-app detection: wlr" /tmp/session.log
+          ! grep -q "does not implement wlr-layer-shell" /tmp/session.log
+          # Ran long enough to count, and the supervisor said so in those words.
+          grep -q "counts as a healthy start" /tmp/session.log
+          grep -q "^rc=0$" /tmp/session.log
+          # Nothing was quarantined: a passing run that had set the user's
+          # configuration aside would be a failure wearing a success.
+          if grep -q "was set aside" /tmp/session.log; then
+            echo "the supervisor quarantined a layer on a healthy run"; exit 1
+          fi
+
       - name: Upload logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
