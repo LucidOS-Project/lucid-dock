@@ -2226,6 +2226,23 @@ void on_activate(GtkApplication* app, gpointer) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    // Renderer choice has to happen before GTK initialises, which is before the
+    // dock reads anything else, so this reads the config file directly rather
+    // than going through the engine. g_setenv with overwrite=FALSE so an
+    // explicit GSK_RENDERER in the environment still wins.
+    {
+        lucid::DockConfig early;
+        if (lucid::read_config(early) && !early.renderer.empty()) {
+            const bool applied = g_setenv("GSK_RENDERER", early.renderer.c_str(), FALSE) != FALSE;
+            const char* effective = g_getenv("GSK_RENDERER");
+            // Worth printing: which renderer is in use is the first question
+            // for any "the dock is slow" report, and it is otherwise invisible.
+            g_message("renderer: config asked for '%s', GSK_RENDERER is now '%s'%s",
+                      early.renderer.c_str(), effective != nullptr ? effective : "(unset)",
+                      applied ? "" : " (setenv failed)");
+        }
+    }
+
     GtkApplication* app = gtk_application_new("dev.lucidos.DockCpp", G_APPLICATION_NON_UNIQUE);
     g_signal_connect(app, "activate", G_CALLBACK(on_activate), nullptr);
 

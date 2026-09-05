@@ -231,6 +231,13 @@ struct DockConfig {
     // Parsed, round-tripped and written into a fresh config file so the keys
     // are discoverable, but not acted on yet. A settings UI needs somewhere to
     // put these before the dock can honour them.
+    // GSK renderer to request, or empty for GTK's own choice. Some GPUs are
+    // much happier with one than the other and GTK has no way to know, so this
+    // is a knob rather than a default. NOTE: GTK 4.16 renamed ngl to gl and
+    // removed the old gl, so the same string means different renderers on
+    // different GTK versions -- which is exactly why nothing is hardcoded.
+    std::string renderer;
+
     std::string layout_mode = "dock";   // dock | taskbar
     std::string position = "bottom";    // bottom | left | right | top
     int icon_size = 0;                  // 0 = the built-in 57.6 px
@@ -267,6 +274,13 @@ inline bool read_config(DockConfig& config) {
     if (!g_key_file_load_from_file(keyfile, path.c_str(), G_KEY_FILE_KEEP_COMMENTS, nullptr)) {
         g_key_file_free(keyfile);
         return false;
+    }
+
+    // Not load_keyfile_value(): that one reads the "Desktop Entry" group,
+    // which is right for .desktop files and wrong for this file.
+    if (gchar* renderer = g_key_file_get_string(keyfile, kConfigGroup, "Renderer", nullptr)) {
+        config.renderer = renderer;
+        g_free(renderer);
     }
 
     config.pinned = key_string_list(keyfile, "Pinned");
@@ -345,9 +359,14 @@ inline bool write_config(const DockConfig& config) {
     g_key_file_set_double(keyfile, kConfigGroup, "MaxScale", config.max_scale);
     g_key_file_set_double(keyfile, kConfigGroup, "Spread", config.spread);
     g_key_file_set_integer(keyfile, kConfigGroup, "IconSize", config.icon_size);
+    g_key_file_set_string(keyfile, kConfigGroup, "Renderer", config.renderer.c_str());
     g_key_file_set_string(keyfile, kConfigGroup, "LayoutMode", config.layout_mode.c_str());
     g_key_file_set_string(keyfile, kConfigGroup, "Position", config.position.c_str());
 
+    g_key_file_set_comment(keyfile, kConfigGroup, "Renderer",
+        " GSK renderer: empty for GTK's default, or gl / ngl / vulkan / cairo.\n"
+        " GSK_RENDERER in the environment overrides this.\n"
+        " GTK 4.16 renamed ngl to gl, so check what your GTK accepts.", nullptr);
     g_key_file_set_comment(keyfile, kConfigGroup, "ShowRunning",
         " Also show running applications that are not pinned.", nullptr);
     g_key_file_set_comment(keyfile, kConfigGroup, "Pinned",

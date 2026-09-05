@@ -482,6 +482,43 @@ sweeps a synthetic pointer across the dock and reports where the frame time
 goes. It is the source of every number below. `LUCID_BENCH_IDLE=1` ticks without doing layout, to separate per-frame
 work from window and compositor cost.
 
+### Re-measured, 4 September 2026
+
+All three renderers now sustain 60 fps, under both the `performance` and
+`power-saver` profiles, on battery:
+
+| Renderer | fps | `layout_panel()` p50 |
+|---|---|---|
+| `gl` | **60** | 0.022 ms |
+| `ngl` | **60** | 0.034 ms |
+| `vulkan` | **60** | 0.036 ms |
+
+**So the workaround below is no longer needed, and its explanation was wrong.**
+The earlier table is kept underneath because the measurement was real, but the
+conclusion drawn from it -- that the ranking was "entirely the renderer's" --
+does not survive re-measurement. Neither the renderer nor the power profile
+predicts the frame rate today.
+
+What changed between the two measurements is code, not configuration: the
+per-icon springs became one envelope, positions gained a `drawn_x` so redundant
+`gtk_fixed_move()` calls are skipped, and the surface became constant.
+`layout_panel()` fell from ~0.1 ms to ~0.03 ms across the board. That is a
+plausible story and it is *not* offered as the cause -- layout was never more
+than 1% of a frame, so it cannot by itself explain 30 fps becoming 60. The
+honest position is that the old numbers describe a build that no longer exists
+and the cause was never established.
+
+If the dock feels slow, measure before changing anything:
+
+    LUCID_DOCK_BENCH=180 ./lucid_dock_cpp
+
+and check the GPU is not parked, which looks identical from the inside:
+
+    cat /sys/class/drm/card*/gt_cur_freq_mhz   # against gt_max_freq_mhz
+    powerprofilesctl get
+
+### Historical: measured under GTK 4.14.5, earlier build
+
 | Configuration | fps | `layout_panel()` p50 |
 |---|---|---|
 | `GSK_RENDERER=gl` (removed in GTK 4.18) | **60** | 0.071 ms |
@@ -489,17 +526,11 @@ work from window and compositor cost.
 | `GSK_RENDERER=vulkan` (GTK 4.16+ default on Wayland) | **20** | 0.058 ms |
 | Any renderer, idle | 60 | — |
 
-`layout_panel()` costs ~0.1 ms in every column, so layout is not the bottleneck
-and the ranking is entirely the renderer's. Note that the fastest column is the
-one doing the *most* layout work per frame — the renderer differences dwarf
-anything the dock does.
-
 Vulkan here is `hasvk`, Mesa's legacy Haswell driver, which announces itself
-with *"Haswell Vulkan support is incomplete"*. On GTK 4.14, launch with
-`GSK_RENDERER=gl` on pre-Gen8 Intel graphics.
+with *"Haswell Vulkan support is incomplete"*.
 
-**This workaround does not survive to the shipping target, and the measurement
-it rests on does not describe it either.** Both caveats are now checked:
+Both caveats on that workaround were checked at the time, and remain true
+regardless of which numbers you believe:
 
 - Ubuntu 26.04 ships GTK **4.22**. The old `gl` renderer was removed in 4.18 —
   `GSK_RENDERER=gl` there prints *"The old GL renderer has been removed"* and
