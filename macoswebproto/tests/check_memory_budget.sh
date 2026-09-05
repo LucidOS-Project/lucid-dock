@@ -93,8 +93,18 @@ measure() {
     # and fontconfig rebuilds, neither of which a running desktop pays. That
     # measures the first second of the first boot rather than what a user
     # lives with.
+    # The output is exactly the dock's surface height on purpose. With no GPU
+    # -- which is every CI runner -- GTK renders through llvmpipe and its
+    # framebuffers are ordinary process memory, so buffer size lands directly
+    # in PSS. With a GPU they do not. That difference is invisible locally and
+    # dominates on a runner: at a 1080p output the floor window tiles to
+    # 1920x1080 while the dock's layer surface is 1920x323, and the floor
+    # measured 226 MiB against the dock's 171 -- a *negative* delta that
+    # sailed through the budget. Matching the output to SURFACE_HEIGHT makes
+    # both probes occupy identical geometry, so what is left is the difference
+    # that was being asked about.
     cat > "$WORK/sway.cfg" <<EOF
-output HEADLESS-1 resolution 1920x1080
+output HEADLESS-1 resolution 1920x323
 exec_always env XDG_CONFIG_HOME=$WORK/config $binary > $WORK/$procname.log 2>&1
 EOF
     mkdir -p "$WORK/config"
@@ -131,6 +141,25 @@ dock=$(measure "$PWD/lucid_dock_cpp" lucid_dock_cpp) || exit 1
 
 delta=$(echo "$dock $floor" | awk '{printf "%.1f", $1-$2}')
 over=$(echo "$delta $BUDGET_MIB" | awk '{print ($1 > $2) ? "yes" : "no"}')
+
+# A measurement that says the dock costs nothing, or costs less than an empty
+# window, is a broken measurement and not good news. This guard exists because
+# the first CI run reported -55.3 MiB and passed: the check was green while
+# protecting nothing, which is worse than having no check at all.
+implausible=$(echo "$delta" | awk '{print ($1 < 1.0) ? "yes" : "no"}')
+if [ "$implausible" = "yes" ]; then
+    echo
+    printf "  %-34s %8s MiB PSS\n" "empty GTK4 window (the floor)" "$floor"
+    printf "  %-34s %8s MiB PSS\n" "lucid_dock_cpp" "$dock"
+    printf "  %-34s %8s MiB\n"     "the dock's own cost" "$delta"
+    echo
+    echo "FAIL: the dock measured $delta MiB above an empty GTK4 window." >&2
+    echo "That is not plausible -- the dock cannot cost less than the window it" >&2
+    echo "draws into -- so the measurement is broken rather than the dock being" >&2
+    echo "free. Usually this means the two probes are not the same size: with no" >&2
+    echo "GPU, framebuffers are counted in PSS and buffer geometry dominates." >&2
+    exit 1
+fi
 
 echo
 printf "  %-34s %8s MiB PSS\n" "empty GTK4 window (the floor)" "$floor"
