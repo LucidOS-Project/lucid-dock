@@ -380,6 +380,9 @@ kinds of setting and they are stored differently.
 | `dock.bounce-duration` | `BOUNCE_DURATION` |
 | `dock.corner-radius` | a literal in the stylesheet |
 | `dock.background-opacity` | a literal in the stylesheet |
+| `dock.icon-size` | `IconSize` in `dock.conf` |
+| `dock.magnify-scale` | `MaxScale` in `dock.conf` |
+| `dock.magnify-range` | `Spread` in `dock.conf` |
 
 The last two matter most, because they show what the model is *for*: the
 `.dock-panel` rule is now generated at run time, so a number that was buried in
@@ -399,9 +402,53 @@ current value, which is already the rule for icon size and magnification. Not
 free: `dock.indicator-size` allows up to 24, so the surface would grow 20 px
 whether or not anyone uses it. A separate change, with the geometry re-measured.
 
-Also not yet moved: `IconSize`, `MaxScale` and `Spread` still come from
-`dock.conf` although the schema defines them, so those three have two possible
-homes until the migration lands.
+### Moving a setting without a flag day
+
+The last three lived in `dock.conf` first, and a user who set them should not
+find their dock silently reverted because the value moved house. So a token
+still at its schema default yields to a non-default `dock.conf` value and says
+so once:
+
+    config: IconSize in dock.conf is deprecated; it moved to the token
+    dock.icon-size. Run: lucid-tokens set dock.icon-size <value>. It is still
+    being honoured because the token is at its default.
+
+Set the token and the token wins. That ordering is what lets the old location be
+retired without a release where everyone's settings reset.
+
+### The schema's ranges are the dock's real limits
+
+`dock.icon-size` allowed up to 256, `dock.magnify-scale` up to 4.0 and
+`dock.magnify-range` up to 12.0. The dock's actual limits are 80, 3.0 and 8.0 --
+its surface is a compile-time constant sized for the largest configuration it
+accepts, so anything beyond those overflows a surface that cannot grow.
+
+That is not a cosmetic mismatch. A range in this schema is *enforced by
+clamping* rather than merely advertised, so the range is the thing standing
+between a config file and a broken dock. A range wider than the consumer's real
+limit is the safety claim failing at exactly the point it is meant to hold:
+`icon-size = 256` used to resolve to 256, which the dock cannot draw. It now
+clamps to 80 and reports it.
+
+### Live reload
+
+The token files are watched, so a change applies to the running dock. Setting
+`dock.icon-size` to 72 takes the drawn panel from 79 px to 93 px without a
+restart, and `lucid-tokens reset-all` takes it back to 79.
+
+Debounced at 150 ms, and that is not premature. The user layer is a directory,
+so a single `lucid-tokens set` arrives as several events -- created, written,
+renamed into place -- and measured, one `set` produced **five** reloads. Each
+tears down and rebuilds every icon, so without the debounce a settings slider
+being dragged would restart the dock's animations continuously. After it, one
+`set` is one reload.
+
+The stylesheet is rebuilt on reload too, because corner radius and background
+opacity are tokens and a `GtkCssProvider` does not re-read itself. The provider
+is created and registered once and re-loaded thereafter -- registering a second
+would leave the old rule underneath, and the `g_object_unref` that was correct
+when this ran exactly once became an over-unref the moment it ran on every
+reload.
 
 ### The safety claim, in the running dock
 

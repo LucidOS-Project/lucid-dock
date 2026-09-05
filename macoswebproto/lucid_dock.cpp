@@ -182,13 +182,60 @@ double BOUNCE_DURATION = 0.4;     // dock.bounce-duration
 // not free: dock.indicator-size allows up to 24, so the surface would grow by
 // 20 px whether or not anyone uses it. A separate change, with the geometry
 // re-measured.
+// The three geometry values, plus whether each is still at its schema default.
+//
+// The "is default" half is what lets dock.conf keep working. IconSize, MaxScale
+// and Spread lived there first, and a user who set them should not have their
+// dock silently revert because the value moved house. So a token still at its
+// default yields to a non-default dock.conf value, and says so once. Set the
+// token and the token wins, which is the only ordering that lets the old
+// location be retired without a flag day.
+struct TokenGeometry {
+    double icon_size = BASE_WIDTH;
+    double magnify_scale = DEFAULT_MAX_SCALE;
+    double magnify_range = 6.0;
+    bool icon_size_default = true;
+    bool magnify_scale_default = true;
+    bool magnify_range_default = true;
+};
+TokenGeometry g_geometry;
+
 void load_tokens(const lucid::Config& cfg) {
+    const auto is_default = [&cfg](const char* key) {
+        return cfg.resolve(key).layer == lucid::Layer::Default;
+    };
+    g_geometry.icon_size = cfg.get_double("dock.icon-size");
+    g_geometry.magnify_scale = cfg.get_double("dock.magnify-scale");
+    g_geometry.magnify_range = cfg.get_double("dock.magnify-range");
+    g_geometry.icon_size_default = is_default("dock.icon-size");
+    g_geometry.magnify_scale_default = is_default("dock.magnify-scale");
+    g_geometry.magnify_range_default = is_default("dock.magnify-range");
+
     PANEL_PADDING_X = static_cast<int>(cfg.get_double("dock.padding-x"));
     ITEM_GAP = static_cast<int>(cfg.get_double("dock.item-gap"));
     BOUNCE_HEIGHT = cfg.get_double("dock.bounce-height");
     BOUNCE_DURATION = cfg.get_double("dock.bounce-duration");
     PANEL_CORNER_RADIUS = cfg.get_double("dock.corner-radius");
     PANEL_BACKGROUND_OPACITY = cfg.get_double("dock.background-opacity");
+}
+
+// Printed when anything is not at its default, and whenever loading had
+// something to say. Provenance is the entire point of the model, so a dock that
+// used it silently would be wasting it -- "why is my dock like this" should be
+// answerable from the log rather than by hunting through files.
+void report_tokens(const lucid::Config& cfg) {
+    for (const auto& [key, resolved] : cfg.changed()) {
+        g_message("token: %-28s %-10s [%s] %s", key.c_str(),
+                  lucid::to_string(resolved.value).c_str(),
+                  lucid::layer_name(resolved.layer), resolved.source_file.c_str());
+    }
+    // Never fatal by design: a malformed config must not cost a session. That
+    // is exactly why it has to be said out loud, or a clamped value looks like
+    // the dock ignoring you.
+    for (const auto& d : cfg.diagnostics()) {
+        g_warning("token: %s in %s: %s -- %s", d.key.c_str(), d.file.c_str(),
+                  d.problem.c_str(), d.action.c_str());
+    }
 }
 
 // The dock slides in from off-screen when it starts, the way the macOS dock is
@@ -617,14 +664,43 @@ class DockEngine {
     // frame rate.
     // Everything derived from the config in one place, so a reload cannot
     // update half of it.
+    void warn_deprecated_key(const char* old_key, const char* token) {
+        if (!warned_deprecated_.insert(old_key).second) {
+            return;
+        }
+        g_warning("config: %s in dock.conf is deprecated; it moved to the token %s. "
+                  "Run: lucid-tokens set %s <value>. It is still being honoured because "
+                  "the token is at its default.",
+                  old_key, token, token);
+    }
+
     void apply_config_geometry() {
-        base_width_ = config_.icon_size > 0
-                          ? std::clamp(static_cast<double>(config_.icon_size),
-                                       static_cast<double>(MIN_ICON_SIZE),
-                                       static_cast<double>(MAX_ICON_SIZE))
-                          : BASE_WIDTH;
-        magnifier_.configure(base_width_, std::clamp(config_.max_scale, MIN_MAX_SCALE, MAX_MAX_SCALE),
-                             config_.spread);
+        // Tokens own these three now. dock.conf is honoured only while the
+        // token is untouched, so an existing setup keeps working and stops
+        // being consulted the moment the value is set in its new home. The
+        // schema's ranges are the dock's own limits, so no clamp is needed on
+        // the token path -- lucid-tokens has already enforced them.
+        base_width_ = g_geometry.icon_size;
+        double max_scale = g_geometry.magnify_scale;
+        double spread = g_geometry.magnify_range;
+
+        if (g_geometry.icon_size_default && config_.icon_size > 0) {
+            base_width_ = std::clamp(static_cast<double>(config_.icon_size),
+                                     static_cast<double>(MIN_ICON_SIZE),
+                                     static_cast<double>(MAX_ICON_SIZE));
+            warn_deprecated_key("IconSize", "dock.icon-size");
+        }
+        if (g_geometry.magnify_scale_default && config_.max_scale != DEFAULT_MAX_SCALE) {
+            max_scale = std::clamp(config_.max_scale, MIN_MAX_SCALE, MAX_MAX_SCALE);
+            warn_deprecated_key("MaxScale", "dock.magnify-scale");
+        }
+        if (g_geometry.magnify_range_default && config_.spread != 6.0) {
+            spread = config_.spread;
+            warn_deprecated_key("Spread", "dock.magnify-range");
+        }
+
+        max_scale_ = max_scale;
+        magnifier_.configure(base_width_, max_scale, spread);
         last_applied_pixel_widths_.clear();
         last_applied_panel_width_ = -1;
         last_icon_scale_ = 0;
@@ -658,6 +734,16 @@ class DockEngine {
     // Printed unconditionally. "The dot is wrong" is three different bugs
     // depending on the answer, and the answer is otherwise invisible from
     // outside the process.
+    // Loaded before anything reads a token, and re-loaded when the files
+    // change. Owned here rather than by main() so live reload has something to
+    // re-load.
+    void start_tokens() {
+        tokens_ = std::make_unique<lucid::Config>(lucid::default_schema());
+        tokens_->load(lucid::default_user_dir(), lucid::default_distro_dir());
+        load_tokens(*tokens_);
+        report_tokens(*tokens_);
+    }
+
     void start_toplevel_source() {
         toplevel_source_ = lucid::make_toplevel_source([this]() { refresh_running_indicators(); });
         g_message("running-app detection: %s -- %s",
@@ -794,6 +880,7 @@ class DockEngine {
 
         install_menu();
         watch_config();
+        watch_tokens();
 
         g_signal_connect(window_, "map", G_CALLBACK(&DockEngine::on_map_static), this);
 
@@ -929,7 +1016,7 @@ class DockEngine {
     double base_width() const { return base_width_; }
     int base_icon_px() const { return icon_px_for(base_width_); }
     int panel_bg_height() const { return panel_bg_height_for(base_icon_px()); }
-    double max_icon_width() const { return base_width_ * config_.max_scale; }
+    double max_icon_width() const { return base_width_ * max_scale_; }
     int max_icon_px() const { return static_cast<int>(max_icon_width() + 0.5); }
     int icon_source_size() const { return max_icon_px() + 1; }
     int window_height() const {
@@ -1749,7 +1836,7 @@ class DockEngine {
                 g_print("idle icon         : y %d .. %d  (inside the panel)\n",
                         idle_near, idle_far);
                 g_print("magnified reaches : y %d  (%d px %s the panel, scale %.2f)\n",
-                        mag_far, overhang, at_top() ? "below" : "above", config_.max_scale);
+                        mag_far, overhang, at_top() ? "below" : "above", max_scale_);
                 g_print("item row (no draw): y %d .. %d\n",
                         panel_y_, panel_y_ + panel_height);
                 g_print("screen-edge gap   : %d px\n", win_h - (panel_bg_y_ + panel_bg_height()));
@@ -2603,6 +2690,77 @@ class DockEngine {
         }
     }
 
+    // The token files, watched as a directory: the user layer is
+    // profile.d/*.ini, so a new file appearing is as much a change as an
+    // existing one being edited, and watching one path would miss it.
+    void watch_tokens() {
+        const std::string dir = lucid::default_user_dir();
+        g_mkdir_with_parents(dir.c_str(), 0700);   // or there is nothing to watch
+        GFile* file = g_file_new_for_path(dir.c_str());
+        token_monitor_ = g_file_monitor_directory(file, G_FILE_MONITOR_NONE, nullptr, nullptr);
+        g_object_unref(file);
+
+        if (token_monitor_ != nullptr) {
+            g_signal_connect(token_monitor_, "changed",
+                             G_CALLBACK(&DockEngine::on_token_files_changed_static), this);
+        }
+    }
+
+    static void on_token_files_changed_static(GFileMonitor*, GFile*, GFile*,
+                                              GFileMonitorEvent event, gpointer user_data) {
+        if (event != G_FILE_MONITOR_EVENT_CHANGES_DONE_HINT &&
+            event != G_FILE_MONITOR_EVENT_CREATED &&
+            event != G_FILE_MONITOR_EVENT_DELETED &&
+            event != G_FILE_MONITOR_EVENT_RENAMED) {
+            return;
+        }
+        static_cast<DockEngine*>(user_data)->schedule_token_reload();
+    }
+
+    // One reload per burst, not one per event.
+    //
+    // Watching a directory means a single `lucid-tokens set` arrives as several
+    // events -- the file is created, written, and renamed into place -- and
+    // measured, one set produced five reloads. Each of those tears down and
+    // rebuilds every icon, so without this a settings slider being dragged
+    // would restart the dock's animations continuously.
+    //
+    // Long enough to swallow a write-then-rename, short enough that a change
+    // still feels immediate.
+    void schedule_token_reload() {
+        if (token_reload_timer_ != 0) {
+            return;   // a reload is already coming; this event is part of it
+        }
+        token_reload_timer_ = g_timeout_add(150, &DockEngine::on_token_reload_due_static, this);
+    }
+
+    static gboolean on_token_reload_due_static(gpointer user_data) {
+        auto* self = static_cast<DockEngine*>(user_data);
+        self->token_reload_timer_ = 0;
+        self->reload_tokens();
+        return G_SOURCE_REMOVE;
+    }
+
+    // Same shape as reload_config(): re-resolve, re-derive, re-lay-out. The
+    // stylesheet is rebuilt too, because corner radius and background opacity
+    // are tokens and a CSS provider does not re-read itself.
+    void reload_tokens() {
+        if (tokens_ == nullptr) {
+            return;
+        }
+        *tokens_ = lucid::Config(lucid::default_schema());
+        tokens_->load(lucid::default_user_dir(), lucid::default_distro_dir());
+        load_tokens(*tokens_);
+        report_tokens(*tokens_);
+
+        install_css();
+        apply_config_geometry();
+        geom_logged_ = false;
+        apply_window_size();
+        rebuild_items();   // icons are rasterised at a size a token can change
+        queue_layout();
+    }
+
     void watch_config() {
         GFile* file = g_file_new_for_path(config_file_path().c_str());
         config_monitor_ = g_file_monitor_file(file, G_FILE_MONITOR_NONE, nullptr, nullptr);
@@ -2809,20 +2967,25 @@ window {
             PANEL_BACKGROUND_OPACITY, PANEL_CORNER_RADIUS);
         gchar* full_css = g_strconcat(kCss, panel_rule, nullptr);
 
-        GtkCssProvider* provider = gtk_css_provider_new();
-        gtk_css_provider_load_from_string(provider, full_css);
+        // One provider for the life of the process, created and registered
+        // once and re-loaded on every token change. Re-loading it is what
+        // re-styles live; registering a second provider would leave the old
+        // rule underneath, and the reference has to be kept rather than
+        // dropped -- this function now runs on every reload, and the unref
+        // that was correct when it ran exactly once became an over-unref of a
+        // GObject the display was still using.
+        if (css_provider_ == nullptr) {
+            css_provider_ = gtk_css_provider_new();
+            if (GdkDisplay* display = gdk_display_get_default()) {
+                gtk_style_context_add_provider_for_display(
+                    display,
+                    GTK_STYLE_PROVIDER(css_provider_),
+                    GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+            }
+        }
+        gtk_css_provider_load_from_string(css_provider_, full_css);
         g_free(panel_rule);
         g_free(full_css);
-
-        GdkDisplay* display = gdk_display_get_default();
-        if (display != nullptr) {
-            gtk_style_context_add_provider_for_display(
-                display,
-                GTK_STYLE_PROVIDER(provider),
-                GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
-        }
-
-        g_object_unref(provider);
     }
 
     static double monotonic_seconds() {
@@ -2857,6 +3020,10 @@ window {
     GtkWidget* menu_ = nullptr;
     GSimpleActionGroup* actions_ = nullptr;
     GFileMonitor* config_monitor_ = nullptr;
+    GFileMonitor* token_monitor_ = nullptr;
+    guint token_reload_timer_ = 0;
+    GtkCssProvider* css_provider_ = nullptr;
+    std::unique_ptr<lucid::Config> tokens_;
     guint launch_poll_id_ = 0;
     GtkIconTheme* icon_theme_ = nullptr;   // owned only when IconTheme is set
     std::map<std::string, WorkStat> work_;
@@ -2872,6 +3039,7 @@ window {
     // invalidated with it.
     std::map<std::string, std::vector<std::string>> candidates_;
     std::set<std::string> last_relevant_;
+    std::set<std::string> warned_deprecated_;
 
     std::optional<std::size_t> drag_from_;
     double drag_origin_x_ = 0.0;
@@ -2912,6 +3080,10 @@ window {
     double intro_offset_ = 0.0;
     std::optional<double> intro_started_at_;
 
+    // The magnification actually in force, which is the token's value unless
+    // a deprecated dock.conf key is still supplying it.
+    double max_scale_ = DEFAULT_MAX_SCALE;
+
     double panel_x_ = 0.0;
     int panel_y_ = 0;
     bool geom_logged_ = false;
@@ -2922,35 +3094,13 @@ window {
     cairo_rectangle_int_t last_input_region_{-1, -1, -1, -1};
 };
 
-// Printed when anything is not at its default, and whenever loading had
-// something to say. Provenance is the entire point of the model, so a dock that
-// used it silently would be wasting it -- "why is my dock like this" should be
-// answerable from the log rather than by hunting through files.
-void report_tokens(const lucid::Config& cfg) {
-    for (const auto& [key, resolved] : cfg.changed()) {
-        g_message("token: %-28s %-10s [%s] %s", key.c_str(),
-                  lucid::to_string(resolved.value).c_str(),
-                  lucid::layer_name(resolved.layer), resolved.source_file.c_str());
-    }
-    // Never fatal by design: a malformed config must not cost a session. That
-    // is exactly why it has to be said out loud, or a clamped value looks like
-    // the dock ignoring you.
-    for (const auto& d : cfg.diagnostics()) {
-        g_warning("token: %s in %s: %s -- %s", d.key.c_str(), d.file.c_str(),
-                  d.problem.c_str(), d.action.c_str());
-    }
-}
 
 void on_activate(GtkApplication* app, gpointer) {
     static DockEngine engine;
 
     // Tokens first: they carry values the stylesheet and the layout are built
     // from, so nothing may read them before they are resolved.
-    static lucid::Config tokens(lucid::default_schema());
-    tokens.load(lucid::default_user_dir(), lucid::default_distro_dir());
-    load_tokens(tokens);
-    report_tokens(tokens);
-
+    engine.start_tokens();
     engine.start_toplevel_source();
     const auto catalog = load_desktop_catalog();
     const DockConfig config = ensure_config(catalog);
