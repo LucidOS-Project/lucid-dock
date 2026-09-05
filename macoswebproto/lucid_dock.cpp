@@ -753,15 +753,24 @@ class DockEngine {
         if (icon.title != tooltip_text_) {
             tooltip_text_ = icon.title;
             gtk_label_set_text(GTK_LABEL(tooltip_), tooltip_text_.c_str());
+            tooltip_w_ = -1;   // measurement is stale
         }
         gtk_widget_set_visible(tooltip_, TRUE);
 
-        int natural_w = 0;
-        int natural_h = 0;
-        gtk_widget_measure(tooltip_, GTK_ORIENTATION_HORIZONTAL, -1, nullptr, &natural_w,
-                           nullptr, nullptr);
-        gtk_widget_measure(tooltip_, GTK_ORIENTATION_VERTICAL, natural_w, nullptr, &natural_h,
-                           nullptr, nullptr);
+        // Measuring a GtkLabel runs a Pango layout, which is expensive enough
+        // to show up as frame-time spikes: doing it every frame took p95 from
+        // 0.04 ms to 0.27 ms with a 4.9 ms worst case. The size only depends on
+        // the text, and the text only changes when the pointer moves to a
+        // different icon -- what changes every frame is the position, which is
+        // arithmetic. So measure on text change and cache it.
+        if (tooltip_w_ < 0) {
+            gtk_widget_measure(tooltip_, GTK_ORIENTATION_HORIZONTAL, -1, nullptr, &tooltip_w_,
+                               nullptr, nullptr);
+            gtk_widget_measure(tooltip_, GTK_ORIENTATION_VERTICAL, tooltip_w_, nullptr,
+                               &tooltip_h_, nullptr, nullptr);
+        }
+        const int natural_w = tooltip_w_;
+        const int natural_h = tooltip_h_;
 
         const double centre = panel_x_ + icon.panel_x + icon.current_width / 2.0;
         double x = centre - natural_w / 2.0;
@@ -1041,6 +1050,10 @@ class DockEngine {
             const double sweep = phase / 0.75;
             const double span = static_cast<double>(panel_content_width_ + 2 * PANEL_PADDING_X);
             current_mouse_x_ = panel_x_ + span * (0.5 - 0.5 * std::cos(sweep * 2.0 * M_PI * 3.0));
+            // Real motion sets this too, and it is what turns the name label
+            // on. A benchmark that left it unset measured a code path nobody
+            // hovers through -- 60 fps here while actual hovering ran at 30.
+            hovered_index_ = icon_at(*current_mouse_x_);
         } else {
             current_mouse_x_.reset();
             hovered_index_.reset();
@@ -2166,6 +2179,8 @@ window {
     GtkWidget* panel_fixed_ = nullptr;
     GtkWidget* tooltip_ = nullptr;
     std::string tooltip_text_;
+    int tooltip_w_ = -1;   // cached natural size; -1 means re-measure
+    int tooltip_h_ = 0;
     std::optional<std::size_t> hovered_index_;
 
     std::vector<IconRuntime> icons_;
