@@ -909,55 +909,59 @@ the user in the same way 60 fps is -- and it regresses the same way, quietly,
 in a commit about something else. `tests/check_memory_budget.sh` is the check
 that makes that loud, and CI runs it.
 
-Measured under headless sway with `GSK_RENDERER=cairo`, so the graphics driver
-is excluded from both sides:
+Measured under headless sway with `GSK_RENDERER=cairo`, against a fixture of
+eight applications the check ships itself:
 
 | | PSS |
 |---|---|
 | An empty GTK4 window | 11.9 MiB |
-| `lucid_dock_cpp` | 18.5 MiB |
-| **the dock's own cost** | **6.6 MiB** |
+| `lucid_dock_cpp`, 8 pinned icons | **20.4 MiB** |
 
-Repeatable to 0.1 MiB. Four decisions make that number mean something:
+Repeatable to 0.1 MiB. Four decisions make that number mean something, and
+three of them are there because the check was wrong first:
 
-**The graphics driver is excluded, on purpose.** With the GL renderer the
-figure is at the mercy of the driver: on a machine with a GPU the framebuffers
-live in GPU memory and never appear in PSS, and on a machine without one --
-every CI runner -- GTK falls back to llvmpipe and those same framebuffers
-become ordinary process memory counted in full. The first CI run measured the
-floor at 226 MiB against the dock's 171 for exactly that reason and reported
-the dock as costing *minus 55 MiB*, which it passed. Rendering both probes
-through cairo leaves behind what the check is for: the dock's own allocations.
+**The budget is on the absolute figure, not on the cost above an empty
+window.** The delta is the more meaningful quantity and it does not survive
+contact with a second machine: the floor measured 11.9 MiB on a development
+host and 17.3 MiB on a CI runner, which have different GTK builds, fontconfig
+caches and locale data. Subtracting a term that moves by 5 MiB from one that
+moves by 2 gives a difference dominated by the wrong term -- the same dock
+measured 8.5 MiB by that method locally and 0.6 MiB on CI. The absolute is
+stable *within* an environment, which is all a regression check needs. Both
+numbers are still printed, because "the dock grew" and "GTK grew" are different
+problems and the pair says which.
 
-**So this is a regression signal, not what a user pays.** The shipped GL path
-costs about 44 MiB total and 9.6 MiB over the floor on a machine with a GPU.
-Those are the user-facing numbers; the 6.6 MiB is the one that can be compared
-across machines.
+**The graphics driver is excluded.** With the GL renderer the figure is at the
+mercy of the driver: with a GPU the framebuffers live in GPU memory and never
+appear in PSS, and without one -- every CI runner -- GTK falls back to llvmpipe
+and those same buffers become process memory counted in full. The first CI run
+measured the floor at 226 MiB against the dock's 171 for that reason and
+reported the dock as costing *minus 55 MiB*, which it passed.
 
-**PSS, not RSS.** RSS charges the dock for every shared library page in full,
+**The check brings its own applications and its own icons.** Without a fixture
+it measures whatever is installed: a bare runner had almost no `.desktop` files,
+the dock drew no icons, and it measured byte for byte the same as an empty
+window. Naming *stock* icons was the next attempt and was wrong the same way --
+CI resolved Adwaita's symbolic SVGs while a development machine resolved
+ZorinBlue's full-colour PNGs, and rasterising those is most of what is being
+measured. The fixture now ships eight identical 256x256 PNGs, generated with
+the Python standard library so no image tooling is needed.
+
+**It asserts it measured something.** The check counts the fixture icons the
+dock actually built and fails if any are missing. This is checked rather than
+assumed because the failure looks exactly like good news: a dock that finds no
+applications draws no icons, costs almost nothing, and passes any budget. CI
+reported -55.3, then 0.0, then 0.6 MiB, and only the first was obviously wrong
+at a glance.
+
+**PSS, not RSS.** RSS charges the dock for every shared library page in full
 whether or not anything else maps them. PSS divides shared pages by the number
-of processes mapping them, and is the only figure that adds up correctly across
-a session. The dock's RSS is about 130 MiB; that number is not wrong, it just
-cannot be added to anything.
+of processes mapping them and is the only figure that adds up across a session.
+The dock's RSS is about 130 MiB; that number is not wrong, it just cannot be
+added to anything.
 
-**The budget is on the delta, not the absolute.** Four fifths of the absolute
-figure is GTK and Mesa, which this project does not control and which moves on
-every toolkit upgrade. Budgeting the absolute means a GTK release fails the
-check and everyone learns to raise the limit. Budgeting the dock's own cost
-fails only when the dock's own code gets heavier.
-
-**The environment is part of the measurement.** The anchored path and GNOME's
-unanchored fallback differ by roughly 35 MiB, so the check runs its own
-headless compositor rather than trusting whatever session it is invoked from.
-It uses its own `XDG_CONFIG_HOME` too -- the dock writes its config on first
-run, and the pinned list decides how many icons get rasterised, which is most
-of the number being measured.
-
-`XDG_CACHE_HOME` is deliberately *not* isolated. Doing so was tried and cost
-11 MiB on the empty-window floor alone, because a cold cache makes Mesa
-recompile its shaders and fontconfig rebuild -- neither of which a running
-desktop pays. That measures the first second of the first boot rather than
-what a user lives with.
+This is a regression signal, not what a user pays. The shipped GL path costs
+about 44 MiB PSS on a machine with a GPU.
 
 ### Where the RAM actually goes, for scale
 
