@@ -95,7 +95,14 @@ constexpr int TOOLTIP_RESERVE = 36;     // headroom to reserve for it
 // makes the label feel like an answer to the pointer, and a slow out is what
 // keeps its disappearance from reading as a second event. Fading it in as well
 // would just be the 500 ms tooltip delay this label exists to avoid.
-constexpr double TOOLTIP_HOLD = 4.0;    // seconds at full opacity
+//
+// The hold was four seconds first and is 2.75 because four felt long, which is
+// the right way to settle it: the label has been read inside the first second,
+// so everything after that is the label sitting on the desktop having already
+// done its job. There is no correct value here and no measurement that would
+// produce one -- these are the two numbers to change if it ever feels wrong
+// again.
+constexpr double TOOLTIP_HOLD = 2.75;   // seconds at full opacity
 constexpr double TOOLTIP_FADE = 0.6;    // seconds to fade out over
 
 // Vertical headroom above a fully magnified icon: enough for the name label,

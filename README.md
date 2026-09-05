@@ -448,10 +448,16 @@ with a slightly more opaque fill.
 
 ### It goes away on its own
 
-Instant in, slow out. The label holds at full opacity for `TOOLTIP_HOLD` (4 s)
-and then fades over `TOOLTIP_FADE` (0.6 s), easing with the same `sine_in_out`
-the launch bounce uses so the dock has one vocabulary of motion rather than one
-per animation.
+Instant in, slow out. The label holds at full opacity for `TOOLTIP_HOLD`
+(2.75 s) and then fades over `TOOLTIP_FADE` (0.6 s) -- gone at 3.35 s -- easing
+with the same `sine_in_out` the launch bounce uses so the dock has one
+vocabulary of motion rather than one per animation.
+
+The hold was 4 s first and is 2.75 s because 4 felt long, which is the right
+way to settle it. The label has been read inside the first second; everything
+after that is it sitting on the desktop having already done its job. There is
+no correct value here and no measurement that would produce one -- these are
+the two constants to change if it ever feels wrong again.
 
 The asymmetry is the point. Appearing instantly is what makes the label read as
 an answer to the pointer -- that is the whole reason it is not GTK's stock
@@ -466,16 +472,16 @@ sway with `swaymsg seat - cursor set`:
 | | |
 |---|---|
 | Pointer reaches an icon | up at full opacity, +20 ms |
-| Held there | fade begins at +4.004 s, gone 0.616 s later |
+| Held there | fade begins at +2.752 s, gone 0.601 s later |
 | Still on the same icon after it has gone | stays gone -- it is not re-shown every frame |
-| Pointer reaches a *different* icon | up again instantly, with a fresh hold |
-| Mid-fade, pointer reaches another icon | back to full opacity, hold restarts (measured 4.005 s, not the remainder) |
+| Pointer reaches a *different* icon | up again instantly, with a fresh hold (+2.751 s, not the remainder of the old one) |
+| Mid-fade, pointer reaches another icon | back to full opacity, hold restarts |
 | Pointer leaves the dock | hidden immediately |
 
 The hold is a one-shot `g_timeout`, not a check on the frame clock. A pointer
 resting on an icon is exactly the case where the dock has stopped ticking, and
-spinning the frame clock for four seconds to discover that four seconds have
-passed would undo the work that stops it. The timer arms on show, is cancelled
+spinning the frame clock for the whole hold to discover that the hold has
+elapsed would undo the work that stops it. The timer arms on show, is cancelled
 on hide, and re-arms when the label moves to another icon; the fade itself runs
 on the tick, which the timer starts.
 
