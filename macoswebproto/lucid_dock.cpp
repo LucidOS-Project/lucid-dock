@@ -737,11 +737,28 @@ class DockEngine {
     // Printed unconditionally. "The dot is wrong" is three different bugs
     // depending on the answer, and the answer is otherwise invisible from
     // outside the process.
+    // What the dock is responsible for reporting. In one place because reload
+    // rebuilds the Config from scratch: stating it only at startup would leave
+    // the dock quiet on the first load and noisy from the first token change
+    // onward, which is the version of this bug that would have shipped.
+    //
+    // The dock reports typos in dock.* and desktop.* and stays quiet about the
+    // panel's keys. Before this, a `lucid-tokens set panel.height` made the dock
+    // warn "unknown key" on every load -- two components, two pinned schema
+    // versions, each calling the other's settings a typo. Everything still
+    // resolves; this is about who speaks up.
+    static lucid::Config make_token_config() {
+        lucid::Config cfg(lucid::default_schema());
+        cfg.own_namespace("dock");
+        cfg.own_namespace("desktop");
+        return cfg;
+    }
+
     // Loaded before anything reads a token, and re-loaded when the files
     // change. Owned here rather than by main() so live reload has something to
     // re-load.
     void start_tokens() {
-        tokens_ = std::make_unique<lucid::Config>(lucid::default_schema());
+        tokens_ = std::make_unique<lucid::Config>(make_token_config());
         tokens_->load(lucid::default_user_dir(), lucid::default_distro_dir());
         load_tokens(*tokens_);
         report_tokens(*tokens_);
@@ -2960,7 +2977,7 @@ class DockEngine {
         if (tokens_ == nullptr) {
             return;
         }
-        *tokens_ = lucid::Config(lucid::default_schema());
+        *tokens_ = make_token_config();
         tokens_->load(lucid::default_user_dir(), lucid::default_distro_dir());
         load_tokens(*tokens_);
         report_tokens(*tokens_);
