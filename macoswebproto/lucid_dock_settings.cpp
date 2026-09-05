@@ -4,6 +4,7 @@
 // in the wrong place.
 
 #include "dock_settings_page.h"
+#include "build_stamp.h"
 
 #include <gtk/gtk.h>
 
@@ -19,15 +20,9 @@ void on_activate(GtkApplication* app, gpointer) {
 
 }  // namespace
 
-#ifndef LUCID_BUILD_STAMP
-#define LUCID_BUILD_STAMP "unknown"
-#endif
-#ifndef LUCID_GIT_REV
-#define LUCID_GIT_REV "unknown"
-#endif
 
 int main(int argc, char** argv) {
-    g_message("lucid-dock-settings %s built %s", LUCID_GIT_REV, LUCID_BUILD_STAMP);
+    g_message("lucid-dock-settings %s built %s", lucid::kGitRev, lucid::kBuildStamp);
     if (argc > 1 && g_strcmp0(argv[1], "--version") == 0) {
         return 0;
     }

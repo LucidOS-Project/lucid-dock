@@ -19,6 +19,8 @@ LucidOS desktop is built around (see "Why out-of-process" below).
 | `macoswebproto/lucid_dock.py` | Python implementation of the same design |
 | `macoswebproto/CMakeLists.txt` | CMake build |
 | `macoswebproto/build_lucid_dock.sh` | Direct g++ build |
+| `macoswebproto/write_build_stamp.sh` | Generates the build stamp; shared by both builds |
+| `macoswebproto/build_stamp.h` | Declares the stamp the two binaries print |
 | `macoswebproto/*.svelte`, `apps-config.ts` | Original web prototype the magnification curve came from |
 | `lucidogdock.py` | Earlier GTK3 prototype |
 
@@ -82,6 +84,38 @@ time.
 Link order matters: `gtk4-layer-shell` works by shimming libwayland, so it has
 to precede it on the link line. Getting this wrong fails at run time, not link
 time. Both build files handle it.
+
+### The build stamp
+
+Both binaries print their git rev and build time at startup and accept
+`--version`, so "is this current?" is answerable from the running process
+rather than by comparing file timestamps by hand:
+
+    ** Message: lucid-dock b0039dd+dirty built 2026-09-04 22:15:06
+
+`write_build_stamp.sh` writes that into a generated translation unit, and both
+build systems call it, so there is one format and one definition of "dirty"
+rather than two that drift.
+
+Three details that are all deliberate:
+
+- **It is a `.cpp`, not a header the sources include.** The stamp has to be
+  recomputed every build to be true, and anything `lucid_dock.cpp` includes
+  would then recompile it every build -- 5.7 s, against 0.01 s for the
+  generated file alone. A no-op `cmake --build` costs 0.57 s and recompiles
+  only the stamp.
+- **CMake regenerates it from a custom target, not `execute_process`.** The
+  latter runs at configure time, so the rev would freeze at whatever was
+  checked out when `cmake` was last run and go quietly stale.
+- **The values are `extern` constants, not macros with an `unknown` fallback.**
+  That fallback is how the CMake build came to emit binaries announcing
+  themselves as `lucid-dock unknown built unknown` for as long as nobody
+  looked: it never defined the macros and the fallback made that silent. A
+  missing stamp is now a link error that produces no binary, which is the
+  failure mode this project wants.
+
+Known gap: "dirty" is `git diff --quiet`, which does not see staged-but-
+uncommitted changes, so a build from a fully staged tree reports a clean rev.
 
 ## Compositor support
 

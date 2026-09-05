@@ -51,6 +51,37 @@ foreach(proto ext-foreign-toplevel-list-v1 wlr-foreign-toplevel-management-unsta
 	list(APPEND LUCID_PROTOCOL_SOURCES "${header}" "${code}")
 endforeach()
 
+# ---------------------------------------------------------------------------
+# Build stamp
+#
+# Both binaries print their git rev and build time at startup, so "is this
+# current?" is answerable from the running process. This build used to skip
+# that and produce binaries announcing themselves as "lucid-dock unknown built
+# unknown", which is the exact failure the stamping exists to prevent.
+#
+# A custom target, not execute_process: execute_process runs at configure time,
+# so the rev would freeze at whatever was checked out when cmake was last run
+# and go quietly stale. A custom target runs on every build.
+#
+# The generated file is a translation unit rather than a header the sources
+# include, because its contents change every build: as a header it would
+# recompile lucid_dock.cpp (5.7 s) every time, whereas this file costs 0.01 s.
+# build_stamp.h is what the sources include, and never changes.
+# ---------------------------------------------------------------------------
+
+set(LUCID_STAMP_CPP "${CMAKE_CURRENT_BINARY_DIR}/generated/build_stamp.cpp")
+
+add_custom_target(lucid_build_stamp
+	BYPRODUCTS "${LUCID_STAMP_CPP}"
+	COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/write_build_stamp.sh"
+	        "${LUCID_STAMP_CPP}" "${CMAKE_CURRENT_SOURCE_DIR}"
+	COMMENT "Stamping git rev and build time"
+	VERBATIM)
+
+# It does not exist until the target above has run, so CMake has to be told not
+# to look for it at configure time.
+set_source_files_properties("${LUCID_STAMP_CPP}" PROPERTIES GENERATED TRUE)
+
 # gtk4-layer-shell is REQUIRED by default. Without it the dock cannot anchor to
 # a screen edge and degrades to an unanchored, fixed-size window. That fallback
 # used to be selected silently by a QUIET check, which made a broken build look
@@ -63,8 +94,11 @@ else()
 	pkg_check_modules(GTK4_LAYER_SHELL REQUIRED IMPORTED_TARGET gtk4-layer-shell-0)
 endif()
 
-add_executable(lucid_dock_cpp lucid_dock.cpp toplevel_source.cpp ${LUCID_PROTOCOL_SOURCES})
-target_include_directories(lucid_dock_cpp PRIVATE "${LUCID_PROTOCOL_DIR}")
+add_executable(lucid_dock_cpp lucid_dock.cpp toplevel_source.cpp "${LUCID_STAMP_CPP}"
+	${LUCID_PROTOCOL_SOURCES})
+target_include_directories(lucid_dock_cpp PRIVATE "${LUCID_PROTOCOL_DIR}"
+	"${CMAKE_CURRENT_SOURCE_DIR}")
+add_dependencies(lucid_dock_cpp lucid_build_stamp)
 
 # gtk4-layer-shell has to precede libwayland on the link line -- it works by
 # shimming libwayland, and being linked after it fails at run time ("GTK4 Layer
@@ -91,5 +125,8 @@ target_link_libraries(lucid_dock_cpp PRIVATE PkgConfig::GTK4 PkgConfig::GIO_UNIX
 
 # The settings UI. Separate binary, shares dock_config.h, and deliberately does
 # not link layer-shell: it is an ordinary application window.
-add_executable(lucid_dock_settings dock_settings_page.cpp lucid_dock_settings.cpp)
+add_executable(lucid_dock_settings dock_settings_page.cpp lucid_dock_settings.cpp
+	"${LUCID_STAMP_CPP}")
+target_include_directories(lucid_dock_settings PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+add_dependencies(lucid_dock_settings lucid_build_stamp)
 target_link_libraries(lucid_dock_settings PRIVATE PkgConfig::GTK4 PkgConfig::GIO_UNIX)

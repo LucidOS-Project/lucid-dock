@@ -11,6 +11,7 @@
 
 #include "dock_config.h"
 #include "toplevel_source.h"
+#include "build_stamp.h"
 
 #include <algorithm>
 #include <cctype>
@@ -2621,18 +2622,12 @@ void on_activate(GtkApplication* app, gpointer) {
 
 }  // namespace
 
-#ifndef LUCID_BUILD_STAMP
-#define LUCID_BUILD_STAMP "unknown"
-#endif
-#ifndef LUCID_GIT_REV
-#define LUCID_GIT_REV "unknown"
-#endif
 
 int main(int argc, char** argv) {
     // Printed unconditionally. Knowing which build is running has repeatedly
     // been the difference between a real measurement and a wasted afternoon,
     // and it costs one line of output.
-    g_message("lucid-dock %s built %s", LUCID_GIT_REV, LUCID_BUILD_STAMP);
+    g_message("lucid-dock %s built %s", lucid::kGitRev, lucid::kBuildStamp);
     if (argc > 1 && (g_strcmp0(argv[1], "--version") == 0)) {
         return 0;
     }

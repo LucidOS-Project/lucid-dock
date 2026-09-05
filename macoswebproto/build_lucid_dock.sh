@@ -70,23 +70,21 @@ esac
 rm -f lucid_dock_cpp lucid_dock_settings
 
 # Stamped into the binary so "is this current?" is answerable from the running
-# process instead of by comparing timestamps by hand.
-BUILD_STAMP="$(date '+%Y-%m-%d %H:%M:%S')"
-GIT_REV="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
-GIT_DIRTY=""
-git diff --quiet 2>/dev/null || GIT_DIRTY="+dirty"
+# process instead of by comparing timestamps by hand. Generated rather than
+# passed as -D defines so the CMake build can use the identical format and the
+# identical definition of "dirty" -- see write_build_stamp.sh.
+./write_build_stamp.sh generated/build_stamp.cpp .
 
 echo "Building with gtk4-layer-shell-0 $(pkg-config --modversion gtk4-layer-shell-0)"
-g++ -std=c++20 -O2 -DHAVE_GTK4_LAYER_SHELL=1 -Igenerated \
-    lucid_dock.cpp toplevel_source.cpp $proto_objs -o lucid_dock_cpp \
+g++ -std=c++20 -O2 -DHAVE_GTK4_LAYER_SHELL=1 -Igenerated -I. \
+    lucid_dock.cpp toplevel_source.cpp generated/build_stamp.cpp $proto_objs -o lucid_dock_cpp \
     $(pkg-config --cflags --libs gtk4-layer-shell-0 gtk4 gio-unix-2.0 wayland-client) \
-    -DLUCID_BUILD_STAMP="\"$BUILD_STAMP\"" -DLUCID_GIT_REV="\"$GIT_REV$GIT_DIRTY\"" \
     $rpath_flag ${LUCID_RPATH:+-Wl,-rpath,"$LUCID_RPATH"}
 echo "Built ./lucid_dock_cpp"
 
 # The settings UI is a separate binary sharing dock_config.h. It has no
 # layer-shell dependency -- it is an ordinary window.
-g++ -std=c++20 -O2 dock_settings_page.cpp lucid_dock_settings.cpp -o lucid_dock_settings \
-    -DLUCID_BUILD_STAMP="\"$BUILD_STAMP\"" -DLUCID_GIT_REV="\"$GIT_REV$GIT_DIRTY\"" \
+g++ -std=c++20 -O2 -I. dock_settings_page.cpp lucid_dock_settings.cpp \
+    generated/build_stamp.cpp -o lucid_dock_settings \
     $(pkg-config --cflags --libs gtk4 gio-unix-2.0)
 echo "Built ./lucid_dock_settings"
