@@ -1,9 +1,11 @@
 #include "dock_settings_page.h"
 
 #include "dock_config.h"
+#include "lucid/tokens.h"
 
 #include <algorithm>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -24,10 +26,18 @@ struct SettingsPage {
     // Held so "Reset to Defaults" can put the displayed values back. Without
     // these the config would change underneath controls still showing the old
     // numbers.
-    GtkWidget* size_scale = nullptr;
     GtkWidget* magnify_switch = nullptr;
-    GtkWidget* max_scale_scale = nullptr;
-    GtkWidget* spread_scale = nullptr;
+
+    // The token-backed controls. A row knows its key, so provenance and reset
+    // are the same code for every setting rather than three copies.
+    struct TokenRow {
+        std::string key;
+        GtkWidget* scale = nullptr;
+        GtkWidget* provenance = nullptr;   // "user", "theme", ... hidden at default
+        GtkWidget* reset = nullptr;        // resets this one key
+    };
+    std::vector<TokenRow> token_rows;
+    std::unique_ptr<lucid::Config> tokens;
 
     // Set while a control is being populated from the config, so that
     // programmatic changes do not write the file back and fight the user.
@@ -319,27 +329,110 @@ GtkWidget* labelled_row(const char* title, const char* subtitle, GtkWidget* cont
     return row;
 }
 
-GtkWidget* build_scale(SettingsPage* page, double lo, double hi, double step, double value,
-                       void (*apply)(SettingsPage*, double)) {
-    GtkWidget* scale = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, lo, hi, step);
-    gtk_range_set_value(GTK_RANGE(scale), value);
-    gtk_scale_set_draw_value(GTK_SCALE(scale), TRUE);
-    gtk_scale_set_value_pos(GTK_SCALE(scale), GTK_POS_RIGHT);
-    gtk_widget_set_size_request(scale, 220, -1);
+// Show where this value came from, and offer to undo just this one.
+//
+// This is the whole argument for the token model made visible. A settings panel
+// that stores only the final value cannot answer "where did this come from" or
+// "put only this back", because it never knew. Here both are one lookup, so
+// they cost a label and a button rather than a feature each.
+void refresh_token_row(SettingsPage* page, const SettingsPage::TokenRow& row) {
+    const lucid::Resolved r = page->tokens->resolve(row.key);
+    const bool overridden = r.layer != lucid::Layer::Default;
+    gtk_label_set_text(GTK_LABEL(row.provenance),
+                       overridden ? lucid::layer_name(r.layer) : "");
+    gtk_widget_set_visible(row.provenance, overridden);
+    gtk_widget_set_visible(row.reset, overridden);
+}
 
-    g_object_set_data(G_OBJECT(scale), "lucid-apply", reinterpret_cast<void*>(apply));
+void refresh_all_token_rows(SettingsPage* page) {
+    for (const auto& row : page->token_rows) {
+        refresh_token_row(page, row);
+    }
+}
+
+// A slider whose range and description come from the schema rather than from
+// numbers repeated here.
+//
+// That is not tidiness. The range in the schema is what the dock can actually
+// contain, and it is enforced by clamping on load -- so a UI that invented its
+// own bounds could offer a value the resolver would then quietly clamp, and the
+// slider would sit somewhere the dock is not. One source, and the control
+// cannot ask for something impossible.
+GtkWidget* build_token_row(SettingsPage* page, const char* title, const std::string& key,
+                           double step) {
+    const lucid::KeyDef* def = page->tokens->schema().find(key);
+    if (def == nullptr) {
+        return gtk_label_new("");   // schema and UI disagree; say nothing rather than guess
+    }
+
+    SettingsPage::TokenRow row;
+    row.key = key;
+    row.scale = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL,
+                                         def->min.value_or(0.0), def->max.value_or(1.0), step);
+    gtk_range_set_value(GTK_RANGE(row.scale), page->tokens->get_double(key));
+    gtk_scale_set_draw_value(GTK_SCALE(row.scale), TRUE);
+    gtk_scale_set_value_pos(GTK_SCALE(row.scale), GTK_POS_RIGHT);
+    gtk_widget_set_size_request(row.scale, 200, -1);
+
+    row.provenance = gtk_label_new("");
+    gtk_widget_add_css_class(row.provenance, "dim-label");
+    gtk_widget_add_css_class(row.provenance, "caption");
+    gtk_widget_set_tooltip_text(row.provenance, "Which layer set this value");
+
+    row.reset = gtk_button_new_from_icon_name("edit-undo-symbolic");
+    gtk_widget_add_css_class(row.reset, "flat");
+    gtk_widget_set_tooltip_text(row.reset, "Reset just this setting");
+    gtk_widget_set_valign(row.reset, GTK_ALIGN_CENTER);
+
+    page->token_rows.push_back(row);
+    const std::string stored_key = key;
+
+    g_object_set_data_full(G_OBJECT(row.scale), "lucid-key", g_strdup(key.c_str()), g_free);
     g_signal_connect_data(
-        scale, "value-changed",
+        row.scale, "value-changed",
         G_CALLBACK(+[](GtkRange* range, gpointer data) {
             auto* p = static_cast<SettingsPage*>(data);
-            auto fn = reinterpret_cast<void (*)(SettingsPage*, double)>(
-                g_object_get_data(G_OBJECT(range), "lucid-apply"));
-            fn(p, gtk_range_get_value(range));
-            save(p);
+            if (p->loading) {
+                return;
+            }
+            const char* k = static_cast<const char*>(
+                g_object_get_data(G_OBJECT(range), "lucid-key"));
+            p->tokens->set_user(k, gtk_range_get_value(range), lucid::default_user_dir());
+            refresh_all_token_rows(p);
         }),
         page, nullptr, G_CONNECT_DEFAULT);
-    return scale;
+
+    g_object_set_data_full(G_OBJECT(row.reset), "lucid-key", g_strdup(key.c_str()), g_free);
+    g_signal_connect_data(
+        row.reset, "clicked",
+        G_CALLBACK(+[](GtkButton* button, gpointer data) {
+            auto* p = static_cast<SettingsPage*>(data);
+            const char* k = static_cast<const char*>(
+                g_object_get_data(G_OBJECT(button), "lucid-key"));
+            p->tokens->reset_user(k, lucid::default_user_dir());
+            // Falls back to whatever the layer beneath says, which is not
+            // necessarily the default -- a theme may still be setting it.
+            p->loading = true;
+            for (const auto& r : p->token_rows) {
+                if (r.key == k) {
+                    gtk_range_set_value(GTK_RANGE(r.scale), p->tokens->get_double(k));
+                }
+            }
+            p->loading = false;
+            refresh_all_token_rows(p);
+        }),
+        page, nullptr, G_CONNECT_DEFAULT);
+
+    GtkWidget* control = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_box_append(GTK_BOX(control), row.provenance);
+    gtk_box_append(GTK_BOX(control), row.scale);
+    gtk_box_append(GTK_BOX(control), row.reset);
+
+    // The description is the schema's, so a key is documented once, in the
+    // place that also validates it.
+    return labelled_row(title, def->summary.empty() ? nullptr : def->summary.c_str(), control);
 }
+
 
 // Appearance only. The pinned list is the user's own arrangement, not a
 // setting with a sensible default, and quietly discarding it because someone
@@ -349,25 +442,28 @@ GtkWidget* build_scale(SettingsPage* page, double lo, double hi, double step, do
 // written out a second time here, so there is one place they can be wrong.
 void reset_to_defaults(SettingsPage* page) {
     const DockConfig defaults;
-
     page->config.magnification = defaults.magnification;
-    page->config.icon_size = defaults.icon_size;
-    page->config.max_scale = defaults.max_scale;
-    page->config.spread = defaults.spread;
 
-    // Put the controls back without each one writing the file on its way.
+    // The token-backed settings are reset by removing them from the user
+    // layer, not by writing the default back over them. Writing the default
+    // would record "the user chose 57.6", which is a different statement from
+    // "the user has not chosen", and it would override a theme that had a
+    // legitimate opinion. This is the same distinction that makes provenance
+    // worth storing at all.
+    for (const auto& row : page->token_rows) {
+        page->tokens->reset_user(row.key, lucid::default_user_dir());
+    }
+
+    // Put the controls back without each one writing on its way.
     page->loading = true;
     gtk_switch_set_active(GTK_SWITCH(page->magnify_switch),
                           defaults.magnification ? TRUE : FALSE);
-    gtk_range_set_value(GTK_RANGE(page->size_scale),
-                        defaults.icon_size > 0 ? defaults.icon_size : 58);
-    gtk_range_set_value(GTK_RANGE(page->max_scale_scale), defaults.max_scale);
-    gtk_range_set_value(GTK_RANGE(page->spread_scale), defaults.spread);
+    for (const auto& row : page->token_rows) {
+        gtk_range_set_value(GTK_RANGE(row.scale), page->tokens->get_double(row.key));
+    }
     page->loading = false;
 
-    // The size slider cannot express "0 means the default", so re-assert it
-    // after the widget has had its say.
-    page->config.icon_size = defaults.icon_size;
+    refresh_all_token_rows(page);
     lucid::write_config(page->config);
 }
 
@@ -381,6 +477,9 @@ GtkWidget* lucid_dock_settings_page_new(void) {
     auto* page = new SettingsPage();
     page->catalog = lucid::load_desktop_catalog();
     page->loading = true;
+    page->tokens = std::make_unique<lucid::Config>(lucid::default_schema());
+    page->tokens->load(lucid::default_user_dir(), lucid::default_distro_dir());
+
     if (!lucid::read_config(page->config)) {
         page->config = lucid::ensure_config(page->catalog);
     }
@@ -398,17 +497,7 @@ GtkWidget* lucid_dock_settings_page_new(void) {
     GtkWidget* behaviour = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_frame_set_child(GTK_FRAME(frame), behaviour);
 
-    // Idle icon size. 0 in the file means "the default", which is not a value a
-    // slider can express, so it is resolved to the default here and written out
-    // as a real number the moment the user touches it.
-    page->size_scale = build_scale(page, 24.0, 80.0, 1.0,
-                                   page->config.icon_size > 0 ? page->config.icon_size : 58,
-                                   [](SettingsPage* p, double v) {
-                                       p->config.icon_size = static_cast<int>(v + 0.5);
-                                   });
-    gtk_box_append(GTK_BOX(behaviour),
-                   labelled_row("Size", "How large the icons are when nothing is hovered.",
-                                page->size_scale));
+    gtk_box_append(GTK_BOX(behaviour), build_token_row(page, "Size", "dock.icon-size", 1.0));
     gtk_box_append(GTK_BOX(behaviour), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL));
 
     GtkWidget* magnify = gtk_switch_new();
@@ -427,22 +516,14 @@ GtkWidget* lucid_dock_settings_page_new(void) {
                    labelled_row("Enlarge icons under the pointer", nullptr, magnify));
 
     gtk_box_append(GTK_BOX(behaviour), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL));
-    gtk_box_append(
-        GTK_BOX(behaviour),
-        labelled_row("Maximum size", "How large an icon gets at the pointer, as a multiple.",
-                     page->max_scale_scale = build_scale(
-                         page, 1.0, 3.0, 0.05, page->config.max_scale,
-                         [](SettingsPage* p, double v) { p->config.max_scale = v; })));
+    gtk_box_append(GTK_BOX(behaviour),
+                   build_token_row(page, "Maximum size", "dock.magnify-scale", 0.05));
 
     gtk_box_append(GTK_BOX(behaviour), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL));
-    gtk_box_append(
-        GTK_BOX(behaviour),
-        labelled_row("Spread",
-                     "How far magnification reaches, in icon widths. Lower makes the icon "
-                     "under the pointer stand out more from its neighbours.",
-                     page->spread_scale = build_scale(
-                         page, 1.5, 8.0, 0.1, page->config.spread,
-                         [](SettingsPage* p, double v) { p->config.spread = v; })));
+    gtk_box_append(GTK_BOX(behaviour),
+                   build_token_row(page, "Spread", "dock.magnify-range", 0.1));
+
+    refresh_all_token_rows(page);
     gtk_box_append(GTK_BOX(column), frame);
 
     GtkWidget* reset = gtk_button_new_with_label("Reset to Defaults");

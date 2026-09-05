@@ -566,6 +566,29 @@ writes, the dock's `GFileMonitor` notices, the change applies live. No IPC, no
 D-Bus, no protocol between the two processes, and no reason for either binary to
 know the other is running.
 
+### The settings page shows where a value came from
+
+Size, maximum size and spread are token-backed, so each row carries the layer
+that set it and a button that resets **only that key**. Both are one lookup
+against the resolver rather than a feature each -- a settings system that stores
+only the final value cannot offer either, because it never knew.
+
+Three things the schema now supplies to the UI rather than the UI repeating
+them:
+
+- **The slider's range.** The schema's range is what the dock can contain and
+  is enforced by clamping on load, so a UI inventing its own bounds could offer
+  a value the resolver would then quietly clamp -- leaving the slider sitting
+  somewhere the dock is not. One source, and the control cannot ask for
+  something impossible.
+- **The row's description.** A key is documented once, in the place that also
+  validates it.
+- **What "reset" means.** Reset removes the key from the user layer rather than
+  writing the default over it. Writing the default would record "the user chose
+  57.6", which is a different statement from "the user has not chosen", and it
+  would override a theme with a legitimate opinion. Resetting falls back to
+  whatever the layer beneath says, which is not necessarily the default.
+
 Controls: size, magnification on/off, maximum size, spread, and the pinned list
 with reorder, remove, add, and a per-row "Separator before" toggle -- a
 separator belongs to the app it precedes, so that is where the control for it

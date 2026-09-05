@@ -95,7 +95,8 @@ echo "Built ./lucid_dock_cpp"
 
 # The settings UI is a separate binary sharing dock_config.h. It has no
 # layer-shell dependency -- it is an ordinary window.
-g++ -std=c++20 -O2 -I. dock_settings_page.cpp lucid_dock_settings.cpp \
-    generated/build_stamp.cpp -o lucid_dock_settings \
+g++ -std=c++20 -O2 -I. -Ithird_party/lucid-tokens/include \
+    dock_settings_page.cpp lucid_dock_settings.cpp \
+    generated/build_stamp.cpp third_party/lucid-tokens/src/tokens.cpp -o lucid_dock_settings \
     $(pkg-config --cflags --libs gtk4 gio-unix-2.0)
 echo "Built ./lucid_dock_settings"
