@@ -156,6 +156,12 @@ constexpr double ENVELOPE_SETTLE_VELOCITY = 0.02;
 constexpr double BOUNCE_HEIGHT = 40.0;
 constexpr double BOUNCE_DURATION = 0.4;
 
+// The dock slides in from off-screen when it starts, the way the macOS dock is
+// revealed. 300 ms because that is the reference's own figure for the same
+// movement -- macos-web animates the auto-hide slide, translate3d(0, 200%, 0),
+// over 300 ms -- rather than a duration picked by eye.
+constexpr double INTRO_DURATION = 0.3;
+
 // A launch keeps bouncing until the application actually appears, so the
 // animation answers "did my click work?" rather than just decorating it. It
 // gives up after LAUNCH_TIMEOUT so an app that never starts -- or one whose
@@ -545,6 +551,21 @@ static double sine_in_out(double progress) {
     return -(std::cos(M_PI * progress) - 1.0) / 2.0;
 }
 
+// Fast to begin with, decelerating into place. The entrance easing, and
+// deliberately not sine_in_out: an ease-in-out starts slowly, which on a slide
+// from off-screen means the dock loiters where it cannot be seen and then
+// hurries the part that can. Same sine family as the bounce, so this adds a
+// shape to the dock's vocabulary of motion rather than a second vocabulary.
+//
+// Also deliberately not the shared spring. That spring is underdamped -- it
+// overshoots by 2% and comes back, which is what makes an icon read as
+// arriving -- and an overshoot at the end of this slide would push the dock
+// past the screen edge it is arriving at. The macOS dock does not bounce when
+// it is revealed.
+static double sine_out(double progress) {
+    return std::sin(progress * M_PI / 2.0);
+}
+
 class DockEngine {
   public:
     DockEngine() = default;
@@ -760,9 +781,54 @@ class DockEngine {
     }
 
   private:
+    // Started from "map" rather than from build_ui(), because the slide has to
+    // begin on the frame the surface first appears. Starting it earlier runs
+    // the first part of the animation while there is nothing on screen, and the
+    // dock arrives already half way up.
     static void on_map_static(GtkWidget*, gpointer user_data) {
         auto* self = static_cast<DockEngine*>(user_data);
+        self->begin_intro();
         self->queue_layout();
+    }
+
+    void begin_intro() {
+        if (intro_played_ || g_getenv("LUCID_DOCK_NO_INTRO") != nullptr) {
+            return;
+        }
+        // The benchmark measures the steady state. Letting the dock slide
+        // through the first 300 ms of it would put an 18-frame layout storm in
+        // the sample and quietly move every number in the report.
+        if (bench_total_ > 0) {
+            intro_played_ = true;
+            return;
+        }
+        intro_played_ = true;
+        intro_started_at_ = monotonic_seconds();
+        intro_offset_ = intro_travel();
+        ensure_tick();
+    }
+
+    // Far enough to be entirely off-screen before it starts: the drawn panel's
+    // height plus the gap it sits above the edge, so nothing pokes out at t=0.
+    // Reversed when docked to the top, where off-screen is upward.
+    double intro_travel() const {
+        const double distance = panel_bg_height() + BOTTOM_MARGIN;
+        return at_top() ? -distance : distance;
+    }
+
+    // True while still moving.
+    bool step_intro(double now) {
+        if (!intro_started_at_.has_value()) {
+            return false;
+        }
+        const double progress = (now - *intro_started_at_) / INTRO_DURATION;
+        if (progress >= 1.0) {
+            intro_started_at_.reset();
+            intro_offset_ = 0.0;
+            return false;
+        }
+        intro_offset_ = intro_travel() * (1.0 - sine_out(progress));
+        return true;
     }
 
     // Is the pointer actually on the dock panel? Coordinates are relative to
@@ -895,7 +961,10 @@ class DockEngine {
         const double y = at_top()
                              ? icon_baseline_y_ + icon.current_width + TOOLTIP_GAP
                              : icon_baseline_y_ - icon.current_width - TOOLTIP_GAP - natural_h;
-        gtk_fixed_move(GTK_FIXED(root_fixed_), tooltip_, x, std::max(0.0, y));
+        // Rides with the dock, or it hangs in mid-air over a dock that has not
+        // arrived yet.
+        gtk_fixed_move(GTK_FIXED(root_fixed_), tooltip_, x,
+                       std::max(0.0, y + intro_offset_));
     }
 
     // LUCID_DOCK_TOOLTIP_TRACE=1: when the label came up, when it started
@@ -1377,8 +1446,14 @@ class DockEngine {
         const bool widths_moving = step_widths(dt);
         const bool offsets_moving = step_offsets(dt);
         const bool tooltip_fading = step_tooltip_fade(now);
-        animations_running =
-            animations_running || widths_moving || offsets_moving || tooltip_fading;
+        const bool intro_moving = step_intro(now);
+        // The intro moves the whole dock, so the layout has to be recomputed
+        // for it even though nothing about the layout itself has changed.
+        if (intro_moving) {
+            layout_dirty_ = true;
+        }
+        animations_running = animations_running || widths_moving || offsets_moving ||
+                             tooltip_fading || intro_moving;
 
         if (g_getenv("LUCID_BENCH_IDLE") != nullptr) {
             layout_dirty_ = false;
@@ -1558,8 +1633,13 @@ class DockEngine {
                            (PANEL_PADDING_Y + ITEM_SLOT_HEIGHT - ICON_BOTTOM_INSET);
             }
 
-            gtk_fixed_move(GTK_FIXED(root_fixed_), panel_bg_, panel_x_, static_cast<double>(panel_bg_y_));
-            gtk_fixed_move(GTK_FIXED(root_fixed_), panel_fixed_, panel_x_, static_cast<double>(panel_y_));
+            // Everything the dock draws hangs off these two, so the slide is
+            // one addition here rather than an offset threaded through every
+            // icon, divider and label.
+            gtk_fixed_move(GTK_FIXED(root_fixed_), panel_bg_, panel_x_,
+                           panel_bg_y_ + intro_offset_);
+            gtk_fixed_move(GTK_FIXED(root_fixed_), panel_fixed_, panel_x_,
+                           panel_y_ + intro_offset_);
 
             // LUCID_DOCK_GEOM=1 dumps the vertical layout once. The dock's
             // geometry is the part that has been wrong most often and it is
@@ -2688,6 +2768,9 @@ window {
     bool tooltip_up_ = false;
     double tooltip_fade_started_at_ = 0.0;
     guint tooltip_fade_timer_ = 0;
+    // Once only. "map" fires again on every unhide, and a dock that re-enacts
+    // its entrance every time it is shown is a dock with a stutter.
+    bool intro_played_ = false;
     int tooltip_w_ = -1;   // cached natural size; -1 means re-measure
     int tooltip_h_ = 0;
     std::optional<std::size_t> hovered_index_;
@@ -2747,6 +2830,12 @@ window {
     gint64 bench_last_frame_us_ = 0;
     std::vector<gint64> bench_frame_us_;
     std::vector<gint64> bench_layout_us_;
+
+    // How far below its resting place the whole dock is currently drawn, and
+    // when the slide began. Cleared once it has finished, so the arithmetic
+    // stops running for the rest of the session.
+    double intro_offset_ = 0.0;
+    std::optional<double> intro_started_at_;
 
     double panel_x_ = 0.0;
     int panel_y_ = 0;

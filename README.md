@@ -819,8 +819,45 @@ slamming the pointer into the screen edge is a dock you have to aim at.
 
 Also from the reference: app-launch bounce is 40 px over 400 ms with sine-in-out
 easing, matching `tweened(0, {duration: 400, easing: sineInOut})`. Not yet
-implemented from it: the auto-hide slide (`transform: translate3d(0, 200%, 0)`
-over 300 ms), group dividers, and the hover tooltip.
+implemented from it: auto-hide itself, and group dividers.
+
+### The dock slides in when it starts
+
+The whole dock translates up from off-screen over 300 ms, the way the macOS
+dock is revealed. 300 ms is the reference's own figure for the same movement --
+macos-web animates its auto-hide slide, `translate3d(0, 200%, 0)`, over 300 ms
+-- rather than a duration picked by eye.
+
+Two choices worth recording, because the obvious options are both wrong here:
+
+**Ease out, not ease-in-out.** The bounce uses `sine_in_out`, and reusing it
+would keep the vocabulary to one function, but an ease-in-out starts slowly --
+which on a slide from off-screen means the dock loiters where it cannot be seen
+and then hurries the part that can. `sine_out` is the same sine family, so this
+adds a shape rather than a second vocabulary.
+
+**Not the shared spring.** That spring is deliberately underdamped: it
+overshoots by 2% and comes back, which is what makes an icon read as *arriving*
+rather than asymptotically giving up. An overshoot at the end of this slide
+would push the dock past the screen edge it is arriving at, and the macOS dock
+does not bounce when it is revealed.
+
+Measured in a nested compositor, offset from resting position per frame:
+
+    83.50  ->  24.52  ->  11.24  ->  2.86  ->  0.32  ->  0
+
+Starts fully off-screen (the drawn panel's height plus the gap it sits above
+the edge), decelerates throughout, and the minimum is 0.32 px -- never negative,
+so it does not overshoot.
+
+Everything the dock draws hangs off two `gtk_fixed_move` calls, so this is one
+addition rather than an offset threaded through every icon, divider and label.
+The name label rides with it, or it would hang in mid-air over a dock that has
+not arrived. It runs once -- `map` fires again on every unhide, and a dock that
+re-enacts its entrance whenever it is shown is a dock with a stutter -- and it
+is skipped under `LUCID_DOCK_BENCH`, where sliding through the first 300 ms of
+the sample would quietly move every number in the report. `LUCID_DOCK_NO_INTRO=1`
+turns it off.
 
 ## Performance notes
 
