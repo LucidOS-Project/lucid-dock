@@ -1,3 +1,19 @@
+lucid-dock (0.1.1-1) noble; urgency=medium
+
+  * Icons resolve through the whole theme inheritance chain before the
+    generic application icon is considered. Passing a fallback list to
+    gtk_icon_theme_lookup_icon() does not mean "try these if the name is
+    not found": GTK tries every name in one theme before any name in the
+    theme it inherits from, so application-x-executable in Lucid beat
+    google-chrome in Lucid-Everything. Nine of twelve pinned icons drew
+    the generic icon; none do now.
+  * The Debian package is built on the shipping target as well as on the
+    development host, so ${shlibs:Depends} records the gtk4-layer-shell
+    dependency. Packages built before this installed cleanly and then
+    failed to start.
+
+ -- Javid Medina <javidamedina@gmail.com>  Sat, 05 Sep 2026 22:40:00 -0400
+
 lucid-dock (0.1.0-1) noble; urgency=medium
 
   * First packaged release.
