@@ -134,8 +134,12 @@ target_link_libraries(lucid_dock_cpp PRIVATE PkgConfig::GTK4 PkgConfig::GIO_UNIX
 
 # The settings UI. Separate binary, shares dock_config.h, and deliberately does
 # not link layer-shell: it is an ordinary application window.
+# The settings page reads and writes tokens too, so it needs the same library
+# the dock does. Missing this compiled fine through build_lucid_dock.sh and
+# failed only here, which is the reason both build paths are in CI.
 add_executable(lucid_dock_settings dock_settings_page.cpp lucid_dock_settings.cpp
-	"${LUCID_STAMP_CPP}")
-target_include_directories(lucid_dock_settings PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+	"${LUCID_STAMP_CPP}" "${LUCID_TOKENS_DIR}/src/tokens.cpp")
+target_include_directories(lucid_dock_settings PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}"
+	"${LUCID_TOKENS_DIR}/include")
 add_dependencies(lucid_dock_settings lucid_build_stamp)
 target_link_libraries(lucid_dock_settings PRIVATE PkgConfig::GTK4 PkgConfig::GIO_UNIX)
