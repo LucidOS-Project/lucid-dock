@@ -760,6 +760,16 @@ class DockEngine {
 
     // Which item is under this x, in root_fixed_ coordinates. Uses the animated
     // width, so the label tracks the icon it belongs to as that icon grows.
+    // A separator before the first icon would be a line hanging off the left
+    // end of the dock, so there is never one there. This has to be the single
+    // answer used by the width sum, the placement, and the widget's visibility:
+    // when it was written out three times, the widget was created for icon 0
+    // and then skipped by the layout, leaving it parked at the panel origin on
+    // top of the first icon.
+    bool draws_divider(std::size_t i) const {
+        return i > 0 && icons_[i].divider_before && icons_[i].divider != nullptr;
+    }
+
     std::optional<std::size_t> icon_at(double x) const {
         for (std::size_t i = 0; i < icons_.size(); ++i) {
             const double left = panel_x_ + icons_[i].panel_x;
@@ -1290,7 +1300,7 @@ class DockEngine {
             next.reserve(widths.size());
 
             for (std::size_t i = 0; i < widths.size(); ++i) {
-                if (i > 0 && icons_[i].divider_before) {
+                if (draws_divider(i)) {
                     cursor += DIVIDER_SLOT;
                 }
                 const double center_x = cursor + widths[i] / 2.0;
@@ -1323,7 +1333,7 @@ class DockEngine {
 
         double content_width = 0.0;
         for (std::size_t i = 0; i < icons_.size(); ++i) {
-            if (i > 0 && icons_[i].divider_before) {
+            if (draws_divider(i)) {
                 content_width += DIVIDER_SLOT;
             }
             content_width += icons_[i].current_width;
@@ -1422,7 +1432,15 @@ class DockEngine {
             for (std::size_t i = 0; i < icons_.size(); ++i) {
                 auto& icon = icons_[i];
 
-                if (i > 0 && icon.divider_before && icon.divider != nullptr) {
+                // Visibility is set from the same predicate that decides
+                // placement, so a separator that is not positioned this frame
+                // is not on screen either -- including after a drag moves its
+                // icon to the front.
+                if (icon.divider != nullptr) {
+                    gtk_widget_set_visible(icon.divider, draws_divider(i) ? TRUE : FALSE);
+                }
+
+                if (draws_divider(i)) {
                     const double line_x = cursor + DIVIDER_MARGIN;
                     if (std::abs(icon.divider_x - line_x) > kPositionEpsilon) {
                         icon.divider_x = line_x;
