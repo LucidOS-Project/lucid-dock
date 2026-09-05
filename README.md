@@ -962,12 +962,37 @@ icon has nothing to offer -- no actions, and either not running or nothing that
 can close it -- it falls through to the dock menu rather than popping an empty
 popover.
 
-**Verified by driving a real pointer**, which took finding out that a *headless*
-sway has a seat with no pointer device at all: `swaymsg seat - cursor set`
-returns `success` and moves nothing, because `capabilities` is 0 and `devices`
-is empty. Nested inside the host session (`WLR_BACKENDS=wayland`) the seat has
-capabilities 3 and the clicks land. Every pointer-driven claim in this README
-needs that, and it is the difference between a test and a test-shaped script.
+**The menu is placed from the icon, not from the click.** It points at the
+icon's current rectangle -- its *magnified* width, so it stays centred while the
+icon is large -- and opens away from the screen edge the dock is against. Aiming
+it at the cursor put it wherever in a 115 px target you happened to press, which
+reads as unanchored.
+
+### Testing a pointer, which was harder than it should have been
+
+`swaymsg seat - cursor set` is not a usable way to test this, in two different
+ways, and both were found the same afternoon:
+
+- Under a **headless** backend the seat has no pointer device at all --
+  `capabilities` 0, `devices` `[]` -- so the request returns `success` and moves
+  nothing.
+- **Nested** in a host session there is a device, but motion only reaches
+  clients while the host's own pointer happens to be over the nested window. Two
+  identical runs of the icon-menu test disagreed, which is what exposed it.
+
+A test that passes depending on where the mouse was left is not a test.
+`tests/virtual_pointer.c` binds `zwlr_virtual_pointer_manager_v1` and creates a
+real input device in the compositor: it works headless, it does not care where
+anything else's cursor is, and both sway and labwc advertise it.
+
+    virtual_pointer move 268 690 1280 720 click right
+
+It found a bug on its first run. The dock connected `motion` and `leave` but not
+**`enter`** -- so a pointer that arrives *without moving* left the dock at rest
+size with the cursor sitting on it, until the user jiggled the mouse. A warp, a
+virtual pointer, or the dock simply mapping underneath a cursor that was already
+there. `enter` carries the same arguments as `motion` and means the same thing
+here, so it is the same handler.
 
 Two bugs it found, both invisible to a compile:
 

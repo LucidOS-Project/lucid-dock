@@ -890,6 +890,16 @@ class DockEngine {
         build_icons(dock_apps);
 
         GtkEventController* motion = gtk_event_controller_motion_new();
+        // "enter" as well as "motion", and with the same handler: they carry
+        // the same arguments and mean the same thing to this dock.
+        //
+        // A pointer that arrives without moving produces enter and no motion --
+        // a warp, a virtual pointer, or the dock simply mapping underneath a
+        // cursor that was already there. Handling only motion left the dock at
+        // rest size with the pointer sitting on it, until the user jiggled the
+        // mouse. Found by an injected pointer, which is the case that does it
+        // every time rather than occasionally.
+        g_signal_connect(motion, "enter", G_CALLBACK(&DockEngine::on_motion_static), this);
         g_signal_connect(motion, "motion", G_CALLBACK(&DockEngine::on_motion_static), this);
         g_signal_connect(motion, "leave", G_CALLBACK(&DockEngine::on_leave_static), this);
         gtk_widget_add_controller(root_fixed_, motion);
@@ -2899,6 +2909,7 @@ class DockEngine {
     // is shown instead. An empty popover appearing where a menu was expected is
     // worse than the general menu appearing.
     bool show_icon_menu(std::size_t index, double x, double y) {
+        (void)y;   // the menu is placed from the icon, not from the click
         if (index >= icons_.size()) {
             return false;
         }
@@ -2959,7 +2970,16 @@ class DockEngine {
         icon_menu_ = gtk_popover_menu_new_from_model(G_MENU_MODEL(menu));
         g_object_unref(menu);
         gtk_popover_set_has_arrow(GTK_POPOVER(icon_menu_), FALSE);
-        gtk_widget_set_halign(icon_menu_, GTK_ALIGN_START);
+        // Centred on the icon and above it, not wherever the click landed.
+        // The menu belongs to the icon, so it should look like it came out of
+        // the icon -- pointing at the cursor puts it wherever in a 115 px
+        // target you happened to press, which reads as unanchored.
+        //
+        // GTK_POS_TOP for the bottom dock and GTK_POS_BOTTOM for a top one:
+        // the menu opens away from the screen edge the dock is against, which
+        // is the only direction it has room to open in.
+        gtk_popover_set_position(GTK_POPOVER(icon_menu_),
+                                 at_top() ? GTK_POS_BOTTOM : GTK_POS_TOP);
         gtk_widget_set_parent(icon_menu_, root_fixed_);
 
         // Held before the popup, because popping up is what generates the
@@ -2970,7 +2990,15 @@ class DockEngine {
         g_signal_connect(icon_menu_, "closed",
                          G_CALLBACK(&DockEngine::on_icon_menu_closed_static), this);
 
-        const GdkRectangle at{static_cast<int>(x), static_cast<int>(y), 1, 1};
+        // The icon's own rectangle, in root_fixed_ coordinates: as wide as the
+        // icon currently is -- which is its *magnified* width, so the menu
+        // stays centred on it while it is large -- and reaching from the icon
+        // baseline up to its top.
+        const int icon_left = static_cast<int>(panel_x_ + icon.panel_x + icon.x_offset);
+        const int icon_w = static_cast<int>(icon.current_width);
+        const int icon_bottom = static_cast<int>(icon_baseline_y_ + intro_offset_);
+        const int icon_top = icon_bottom - icon_w;
+        const GdkRectangle at{icon_left, icon_top, icon_w, icon_w};
         gtk_popover_set_pointing_to(GTK_POPOVER(icon_menu_), &at);
         gtk_popover_popup(GTK_POPOVER(icon_menu_));
         queue_layout();
