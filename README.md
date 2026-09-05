@@ -385,6 +385,7 @@ kinds of setting and they are stored differently.
 | `dock.icon-size` | `IconSize` in `dock.conf` |
 | `dock.magnify-scale` | `MaxScale` in `dock.conf` |
 | `dock.magnify-range` | `Spread` in `dock.conf` |
+| `dock.icon-ink-ratio` | nothing -- icons were whatever size their theme drew them |
 
 The last two matter most, because they show what the model is *for*: the
 `.dock-panel` rule is now generated at run time, so a number that was buried in
@@ -605,6 +606,68 @@ written out a second time, so there is one place for them to be wrong.
 `dock_config.h` is header-only. The shared surface is a config struct, a
 `.desktop` catalogue, and the functions that read and write them; a static
 library would be more build system than that is worth.
+
+## Icons are not drawn to a common grid
+
+They arrive from whichever theme answers the lookup, and the answers do not
+agree about how much of the box the artwork should fill. Measured across the
+default pinned set, with `LUCID_DOCK_ICONS=1`:
+
+| | ink, as a fraction of the box |
+|---|---|
+| `google-chrome`, `code` | **1.000** -- edge to edge |
+| most icons resolving in the theme | 0.879 |
+| `org.gnome.Terminal`, `Calendar` | 0.828 |
+| **spread** | **0.172** |
+
+Chrome is the visible one, and the reason is worth stating because it is not a
+bug in the theme: it does not resolve in `Lucid` at all. It falls through to
+`hicolor` -- the application's *own* installed icon, drawn to whatever grid its
+vendor chose -- and so stood about 11% taller than everything beside it.
+
+`dock.icon-ink-ratio` (default 0.9) scales each icon so the larger of its two
+ink dimensions occupies the same fraction of the box:
+
+| | spread |
+|---|---|
+| before | 0.172 |
+| after | **0.012** |
+
+Four decisions in that, three of which exist because the obvious version is
+wrong:
+
+- **It measures the alpha bounding box, not the file's canvas.** The canvas is
+  the thing that disagrees between themes; the artwork inside it is what the eye
+  compares.
+- **It re-centres on the ink rather than the canvas.** An icon whose artwork
+  sits low in its own file would otherwise be scaled correctly into a new
+  vertical offset -- the size fixed and the position broken.
+- **It does nothing when the icon is already within 2%.** Resampling to move an
+  icon 1% is a quality cost for no visible change, and most icons that resolve
+  in one theme are already in agreement with each other.
+- **Upscaling is capped at 1.5x.** An icon that is tiny inside its own canvas
+  would otherwise be enlarged until it was the only blurry thing on the dock.
+  Failing to reach the target is the better outcome.
+
+Symbolic icons keep the `GtkIconPaintable` path, because that is what recolours
+them from the widget's colour; loading one through `GdkPixbuf` gives a correctly
+sized icon in flat black, which is not an improvement. `0` disables the whole
+thing and leaves every icon exactly as its theme drew it.
+
+**One icon of twelve disappeared on the first attempt**, and the way it happened
+is the point. `gdk_pixbuf_composite()` asserts
+`dest_y + dest_height <= dest->height` and, when that fails, draws *nothing* --
+so an out-of-range destination rectangle is not a clipped icon, it is an absent
+one. The rectangle was being derived from the scaled image's size instead of
+intersected with the box, which ignores a positive offset, so it blanked exactly
+those icons whose artwork sits low in its own canvas. It is now an intersection.
+
+A screenshot caught it; the arithmetic looked right and the log said nothing.
+The first attempt at *measuring* the result was worse -- reading ink heights
+back out of the screenshot reported all twelve icons at exactly 85 px, which was
+the crop height rather than any icon. A check reporting a constant is reporting
+its own bug. `LUCID_DOCK_ICONS=1` exists because of that: it prints, per icon,
+the file that won the lookup, the ink fraction measured, and the factor applied.
 
 ## The name label
 

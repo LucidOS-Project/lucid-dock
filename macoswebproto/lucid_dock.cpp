@@ -60,6 +60,8 @@ constexpr int BOTTOM_MARGIN = 8;
 // are written into the stylesheet at run time by install_css().
 double PANEL_CORNER_RADIUS = 19.0;
 double PANEL_BACKGROUND_OPACITY = 0.4;
+// dock.icon-ink-ratio. 0 leaves every icon exactly as its theme drew it.
+double ICON_INK_RATIO = 0.9;
 
 
 
@@ -217,6 +219,7 @@ void load_tokens(const lucid::Config& cfg) {
     BOUNCE_DURATION = cfg.get_double("dock.bounce-duration");
     PANEL_CORNER_RADIUS = cfg.get_double("dock.corner-radius");
     PANEL_BACKGROUND_OPACITY = cfg.get_double("dock.background-opacity");
+    ICON_INK_RATIO = cfg.get_double("dock.icon-ink-ratio");
 }
 
 // Printed when anything is not at its default, and whenever loading had
@@ -2020,6 +2023,169 @@ class DockEngine {
         return scale > 0 ? scale : 1;
     }
 
+    // Scale an icon's artwork so it occupies the same fraction of its box as
+    // every other icon's.
+    //
+    // Icons do not arrive from one place. An application that ships its own
+    // under hicolor is drawn to whatever grid its vendor chose; a theme's own
+    // icons share the theme's margin. Measured across the default pinned set,
+    // the artwork filled between 84.5% and 100% of the box, and the 100% was
+    // Chrome -- which resolves in hicolor rather than in the theme at all, and
+    // therefore stood ~11% taller than everything beside it.
+    //
+    // This measures the alpha bounding box, scales the image so the larger of
+    // its two ink dimensions hits dock.icon-ink-ratio, and re-centres on the
+    // ink rather than on the canvas, since an icon whose artwork sits off
+    // centre in its own file would otherwise be normalised into a new offset.
+    // Returns nullptr when nothing needs doing, which is the common case and
+    // avoids resampling an icon to arrive back where it started.
+    //
+    // Rasterised at the same generous source size the rest of this path uses,
+    // so an icon being scaled up is scaled up from a large raster rather than
+    // from a 58 px one.
+    static GdkTexture* normalised_icon_texture(const char* path, int box,
+                                               const char* who) {
+        static const bool trace = g_getenv("LUCID_DOCK_ICONS") != nullptr;
+        if (ICON_INK_RATIO <= 0.0 || path == nullptr) {
+            if (trace) {
+                g_message("icon %-34s %s", who,
+                          path == nullptr ? "no file -- left to the paintable"
+                                          : "normalisation off");
+            }
+            return nullptr;
+        }
+        // Symbolic icons are recoloured by GtkIconPaintable from the widget's
+        // colour. Loading one through GdkPixbuf drops that and yields flat
+        // black, so they keep the paintable path -- a correctly sized icon of
+        // the wrong colour is not an improvement.
+        const std::string p(path);
+        if (p.find("symbolic") != std::string::npos) {
+            if (trace) g_message("icon %-34s symbolic -- left to the paintable", who);
+            return nullptr;
+        }
+
+        GError* error = nullptr;
+        GdkPixbuf* src = gdk_pixbuf_new_from_file_at_size(path, box, box, &error);
+        if (src == nullptr) {
+            g_clear_error(&error);
+            return nullptr;
+        }
+
+        // Square the canvas first, so "fraction of the box" means the same
+        // thing for an icon whose file is not square as for one whose is.
+        GdkPixbuf* canvas = gdk_pixbuf_new(GDK_COLORSPACE_RGB, TRUE, 8, box, box);
+        if (canvas == nullptr) {
+            g_object_unref(src);
+            return nullptr;
+        }
+        gdk_pixbuf_fill(canvas, 0x00000000);
+        const int sw = gdk_pixbuf_get_width(src);
+        const int sh = gdk_pixbuf_get_height(src);
+        const int cx0 = (box - sw) / 2;
+        const int cy0 = (box - sh) / 2;
+        gdk_pixbuf_composite(src, canvas, cx0, cy0, sw, sh, cx0, cy0, 1.0, 1.0,
+                             GDK_INTERP_NEAREST, 255);
+        g_object_unref(src);
+
+        // Alpha bounding box. The threshold is not zero because a lot of
+        // artwork carries a faint drop shadow or an antialiased skirt that is
+        // not the icon and should not set its size.
+        const int w = gdk_pixbuf_get_width(canvas);
+        const int h = gdk_pixbuf_get_height(canvas);
+        const int nc = gdk_pixbuf_get_n_channels(canvas);
+        const int rs = gdk_pixbuf_get_rowstride(canvas);
+        const guchar* px = gdk_pixbuf_read_pixels(canvas);
+        int minx = w, miny = h, maxx = -1, maxy = -1;
+        if (gdk_pixbuf_get_has_alpha(canvas)) {
+            for (int y = 0; y < h; ++y) {
+                const guchar* row = px + static_cast<size_t>(y) * rs;
+                for (int x = 0; x < w; ++x) {
+                    if (row[x * nc + 3] > 8) {
+                        if (x < minx) minx = x;
+                        if (x > maxx) maxx = x;
+                        if (y < miny) miny = y;
+                        if (y > maxy) maxy = y;
+                    }
+                }
+            }
+        } else {
+            minx = 0; miny = 0; maxx = w - 1; maxy = h - 1;
+        }
+        if (maxx < 0) {                       // entirely transparent
+            g_object_unref(canvas);
+            return nullptr;
+        }
+
+        const double ink_w = maxx - minx + 1;
+        const double ink_h = maxy - miny + 1;
+        const double current = std::max(ink_w, ink_h) / static_cast<double>(box);
+        if (current <= 0.0) {
+            g_object_unref(canvas);
+            return nullptr;
+        }
+
+        double factor = ICON_INK_RATIO / current;
+        // An icon whose artwork is tiny in its own canvas would otherwise be
+        // blown up until it was the only blurry thing on the dock. Capped, and
+        // the cap failing to reach the target is the better outcome.
+        factor = std::min(factor, 1.5);
+        // Within a couple of percent it is already right, and resampling to
+        // move it is a quality cost for no visible change.
+        if (std::fabs(factor - 1.0) < 0.02) {
+            if (trace) {
+                g_message("icon %-34s ink %.3f  already within 2%% -- untouched  [%s]",
+                          who, current, path);
+            }
+            g_object_unref(canvas);
+            return nullptr;
+        }
+
+        const int nw = std::max(1, static_cast<int>(std::lround(w * factor)));
+        const int nh = std::max(1, static_cast<int>(std::lround(h * factor)));
+        GdkPixbuf* scaled = gdk_pixbuf_scale_simple(canvas, nw, nh, GDK_INTERP_BILINEAR);
+        g_object_unref(canvas);
+        if (scaled == nullptr) {
+            return nullptr;
+        }
+
+        GdkPixbuf* out = gdk_pixbuf_new(GDK_COLORSPACE_RGB, TRUE, 8, box, box);
+        if (out == nullptr) {
+            g_object_unref(scaled);
+            return nullptr;
+        }
+        gdk_pixbuf_fill(out, 0x00000000);
+        const double ink_cx = (minx + ink_w / 2.0) * factor;
+        const double ink_cy = (miny + ink_h / 2.0) * factor;
+        const int ox = static_cast<int>(std::lround(box / 2.0 - ink_cx));
+        const int oy = static_cast<int>(std::lround(box / 2.0 - ink_cy));
+        // The destination rectangle is the intersection of where the scaled
+        // image lands with the box, and it has to be computed as an
+        // intersection rather than from the source size: gdk_pixbuf_composite
+        // asserts dest_y + dest_height <= height and *silently draws nothing*
+        // when that fails, so an off-by-a-few here is not a clipped icon, it is
+        // an absent one. Deriving the height from nh alone ignored a positive
+        // offset and blanked exactly those icons whose artwork sits low in its
+        // own canvas -- one of twelve, which is precisely the density of bug
+        // that ships.
+        const int dx0 = std::max(0, ox);
+        const int dy0 = std::max(0, oy);
+        const int dx1 = std::min(box, ox + nw);
+        const int dy1 = std::min(box, oy + nh);
+        if (dx1 > dx0 && dy1 > dy0) {
+            gdk_pixbuf_composite(scaled, out, dx0, dy0, dx1 - dx0, dy1 - dy0,
+                                 ox, oy, 1.0, 1.0, GDK_INTERP_BILINEAR, 255);
+        }
+        g_object_unref(scaled);
+
+        if (trace) {
+            g_message("icon %-34s ink %.3f -> %.3f  x%.3f  [%s]", who, current,
+                      current * factor, factor, path);
+        }
+        GdkTexture* texture = gdk_texture_new_for_pixbuf(out);
+        g_object_unref(out);
+        return texture;
+    }
+
     // Rasterise at icon_source_size() x scale so every magnification step and
     // every display scale is a downscale rather than an upscale.
     void apply_icon_paintable(IconRuntime& icon) {
@@ -2045,10 +2211,37 @@ class DockEngine {
             }
         }
 
-        if (paintable != nullptr) {
-            gtk_image_set_from_paintable(GTK_IMAGE(icon.image), GDK_PAINTABLE(paintable));
-            g_object_unref(paintable);
+        if (paintable == nullptr) {
+            return;
         }
+
+        // The file behind the icon, whichever way it was found. The theme
+        // lookup is asked rather than second-guessed, so an icon that resolved
+        // through the Lucid -> Lucid-Everything -> Adwaita fallback chain is
+        // normalised against the file that actually won.
+        const char* path = nullptr;
+        GFile* resolved = nullptr;
+        if (!icon.resolved_file.empty()) {
+            path = icon.resolved_file.c_str();
+        } else {
+            resolved = gtk_icon_paintable_get_file(paintable);
+            if (resolved != nullptr) {
+                path = g_file_peek_path(resolved);
+            }
+        }
+
+        const int box = icon_source_size() * scale;
+        if (GdkTexture* normalised =
+                normalised_icon_texture(path, box, icon.desktop_id.c_str())) {
+            gtk_image_set_from_paintable(GTK_IMAGE(icon.image), GDK_PAINTABLE(normalised));
+            g_object_unref(normalised);
+        } else {
+            gtk_image_set_from_paintable(GTK_IMAGE(icon.image), GDK_PAINTABLE(paintable));
+        }
+        if (resolved != nullptr) {
+            g_object_unref(resolved);
+        }
+        g_object_unref(paintable);
     }
 
     void reload_icons_for_scale() {
