@@ -764,14 +764,33 @@ class DockEngine {
         window_ = gtk_application_window_new(app);
         gtk_window_set_title(GTK_WINDOW(window_), "Lucid Dock C++");
         gtk_window_set_decorated(GTK_WINDOW(window_), FALSE);
-        gtk_window_set_resizable(GTK_WINDOW(window_), FALSE);
     #if defined(HAVE_GTK4_LAYER_SHELL)
         // Compile-time availability is not run-time availability: Mutter does not
         // implement wlr-layer-shell, so a binary built with layer-shell still has
         // to run without it on GNOME. Ask before initialising rather than letting
         // gtk4-layer-shell warn once per property set.
+        //
+        // This has to be answered before the window is made non-resizable,
+        // because the answer is what that setting depends on.
         layer_shell_active_ = gtk_layer_is_supported();
     #endif
+
+        // Non-resizable is right for the fallback toplevel -- nobody should be
+        // able to drag the dock's edges -- and wrong under layer-shell, where it
+        // silently defeats the anchors.
+        //
+        // A non-resizable GTK window refuses a configure larger than its natural
+        // size, and gtk4-layer-shell sizes the layer surface from what the window
+        // will accept. So the surface came out the width of the drawn panel
+        // instead of the width of the output, the left+right anchors had nothing
+        // to stretch, and centring the panel inside an 821 px surface put the dock
+        // in the bottom-left corner of a 1280 px screen. Reproduced identically on
+        // sway and labwc.
+        //
+        // It stayed hidden because every geometry measurement to date was taken
+        // on GNOME, where the fallback pins the width by hand and centring works.
+        // The path that ships is the one that was never looked at.
+        gtk_window_set_resizable(GTK_WINDOW(window_), layer_shell_active_ ? TRUE : FALSE);
 
         // Fallback path only. Pin the toplevel to the full monitor width: without
         // it the window auto-sizes to the dock panel, and because the panel resizes

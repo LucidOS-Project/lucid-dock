@@ -130,6 +130,7 @@ implement that protocol and does **not** work on GNOME:
 |---|---|---|
 | KWin (Plasma) | Yes | Primary development target |
 | Hyprland, Sway, COSMIC, wlroots-based | Yes | |
+| labwc | Yes | Stacking rather than tiling, and ships no shell of its own -- the LucidOS session compositor |
 | **GNOME / Mutter** | **No** | Mutter does not implement `wlr-layer-shell` and has consistently declined to |
 | X11 | No | Wayland only |
 
@@ -315,6 +316,7 @@ Checked by binding the registry and listing globals, not by reading changelogs:
 |---|---|---|---|
 | GNOME / Mutter 46 | no | no | no |
 | sway 1.9 (wlroots 0.17), Ubuntu 24.04 | v4 | **no** | v3 |
+| labwc 0.7.1 (wlroots 0.17.1), Ubuntu 24.04 | v4 | **no** | v3 |
 | sway 1.10+ (wlroots 0.18+), KWin 6, Hyprland, COSMIC, niri | yes | yes | yes |
 
 `ext-foreign-toplevel-list-v1` is the standard and is what the dock prefers.
@@ -670,6 +672,51 @@ It needs headroom, so the surface is now 198 px rather than 160 at `MaxScale`
 2.0. **Known consequence:** the dock's surface is monitor-wide and now taller,
 and a layer surface takes pointer input across its whole area unless an input
 region is set, which GTK does not expose. Worth fixing before this ships.
+
+### The dock was never centred on the path that ships
+
+Every geometry figure in this README was measured on GNOME, and that turned out
+to be the whole problem.
+
+Under layer-shell the dock anchors left, right and bottom, so the compositor is
+supposed to hand it the output width and the panel is centred inside that. It
+was instead coming back the width of the drawn panel, which put the panel at
+x = 0 -- the dock sitting in the bottom-left corner of the screen rather than
+centred above the screen edge.
+
+    output 1280 px, surface 821 px, panel at x = 0
+
+The cause is one line, and it is not in the layer-shell code:
+
+    gtk_window_set_resizable(GTK_WINDOW(window_), FALSE);
+
+That is correct for the fallback toplevel -- nobody should be able to drag the
+dock's edges -- and it silently defeats the anchors under layer-shell. A
+non-resizable GTK window will not accept a configure larger than its natural
+size, and gtk4-layer-shell sizes the layer surface from what the window will
+accept, so the surface came out panel-width, the left+right anchors had nothing
+to stretch, and centring inside 821 px put the dock in the corner. It is now
+`layer_shell_active_ ? TRUE : FALSE`, which means the probe has to happen before
+the call rather than after it.
+
+| | surface | panel |
+|---|---|---|
+| `resizable FALSE` (was) | 821 px on a 1280 px output | x = 0, bottom-left |
+| `resizable TRUE` under layer-shell | **1280 px** | centred |
+
+**Why it hid for so long.** On GNOME there is no layer-shell, so
+`apply_window_size()` pins the toplevel to the monitor width by hand and
+centring works. The 1440 px in the geometry dumps above is this development
+laptop's logical width -- every one of those numbers is the *fallback* path.
+The supported path was measured for height, for the shadow, for the tooltip and
+for the intro slide, and never once for horizontal placement, because on the
+machine the work was done on it was never wrong.
+
+Reproduced identically on sway 1.9 and labwc 0.7.1 before the fix, and fixed on
+both after it, by screenshotting a headless compositor with `grim`. A screenshot
+is what caught this: it is exactly the class of bug `LUCID_DOCK_GEOM=1` exists
+for, and the printer was reporting the wrong width quite honestly the whole
+time with nobody reading it against a screen.
 
 ### The surface is a constant size
 
