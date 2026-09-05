@@ -136,9 +136,14 @@ constexpr double BOUNCE_DURATION = 0.4;
 
 // A launch keeps bouncing until the application actually appears, so the
 // animation answers "did my click work?" rather than just decorating it. It
-// gives up after LAUNCH_TIMEOUT so an app that never starts -- or one we
-// cannot match to a process -- stops bouncing rather than bouncing forever.
-constexpr double LAUNCH_TIMEOUT = 20.0;
+// gives up after LAUNCH_TIMEOUT so an app that never starts -- or one whose
+// process name we cannot match -- stops bouncing rather than bouncing forever.
+//
+// Five seconds, not twenty. Past about five the bounce has stopped saying
+// "starting" and started saying "something is wrong", and twenty seconds of it
+// is an irritation rather than feedback. Anything slower than that is better
+// served by the icon going quiet and the running dot appearing late.
+constexpr double LAUNCH_TIMEOUT = 5.0;
 constexpr unsigned LAUNCH_POLL_MS = 400;
 
 // A frame at 60 Hz is 16.7 ms, so anything approaching a millisecond off the
