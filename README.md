@@ -561,6 +561,45 @@ compositor delivers and what the dock counts as "on the dock" cannot disagree.
 It follows the icons as they magnify, and is only pushed to the compositor when
 it actually changes.
 
+### The shadow was a slab, not a shadow
+
+Reported as "really blocky when a white application is behind it", and that is
+exactly the condition that exposes it.
+
+    2px 5px 19px 7px rgba(0, 0, 0, 0.3)
+                     ^^^ spread
+
+Spread is not blur. It inflates the shadow rectangle by 7 px on every side at
+the full 30% black *before* anything is blurred, so the panel sat inside a
+near-solid dark slab and the 19 px blur only ever softened that slab's outer
+edge. Over a dark wallpaper it is invisible. Over a white application it is a
+grey brick with the panel sitting in it.
+
+Two shadows with no spread instead -- a tight one for contact, a broad soft one
+for ambience, which is the usual way to get a shadow that reads as depth rather
+than as an object:
+
+        0 2px 8px rgba(0, 0, 0, 0.13),
+        0 8px 28px rgba(0, 0, 0, 0.17);
+
+Measured straight down from the panel's bottom edge over white, computed from
+the CSS spec's own definition (blur radius *b* is a Gaussian with sigma *b*/2,
+spread inflates the shape first):
+
+| px below the edge | 0 | 3 | 6 | 9 | 12 | 18 | 24 | 30 |
+|---|---|---|---|---|---|---|---|---|
+| Before (grey, 255 = white) | 214 | **192** | 198 | 207 | 215 | 233 | 246 | 253 |
+| After | 224 | **214** | 225 | 232 | 238 | 244 | 249 | 252 |
+
+The darkest point goes from 25% to 16% darkening, and more importantly the
+plateau becomes a gradient -- before, the shadow got *darker* over the first
+3 px and then held, which is the signature of a spread rather than a blur.
+
+**The 1px dark ring above it is load-bearing and should not be tidied away.**
+The panel is 40% white, so over a white application it is very nearly invisible
+and the ring is the only thing still saying where the dock is. Against white,
+the border and the shadow are the dock.
+
 ## Right-click menu
 
 Right-click anywhere on the dock: Magnification, Edit Configuration File…,

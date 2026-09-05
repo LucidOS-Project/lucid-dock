@@ -2623,13 +2623,27 @@ window {
     background-color: rgba(20, 20, 20, 0.30);
 }
 
+/* The 1px dark ring is load-bearing, not decoration: the panel is 40% white,
+   so over a white application it is very nearly invisible and the ring is what
+   still says where the dock is. Do not remove it to "clean up" the edge.
+
+   The drop shadow had a 7px spread, and spread is not blur -- it inflates the
+   shadow rectangle by 7px at the full 30% black *before* any blurring, so the
+   panel sat inside a near-solid slab whose outer edge was all the 19px blur
+   ever softened. Invisible over a dark wallpaper and a grey brick over a white
+   application, which is exactly how it was reported.
+
+   Two shadows with no spread instead: a tight one for contact, a broad soft one
+   for ambience. Measured straight down from the panel's bottom edge over white,
+   the darkest point goes from 25% to 16% and the plateau becomes a gradient. */
 .dock-panel {
     background: rgba(255, 255, 255, 0.4);
     border-radius: 19px;
     box-shadow:
         inset 0 0 0 1px rgba(255, 255, 255, 0.28),
         0 0 0 1px rgba(20, 20, 20, 0.22),
-        2px 5px 19px 7px rgba(0, 0, 0, 0.3);
+        0 2px 8px rgba(0, 0, 0, 0.13),
+        0 8px 28px rgba(0, 0, 0, 0.17);
 }
 )CSS";
 
