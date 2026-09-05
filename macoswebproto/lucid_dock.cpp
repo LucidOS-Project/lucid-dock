@@ -2801,6 +2801,25 @@ class DockEngine {
             g_object_unref(action);
         }
 
+        // Per-icon items are two parameterised actions rather than one action
+        // per icon per entry: the pinned list is editable at run time, and
+        // registering and unregistering actions as icons come and go is a
+        // lifetime problem in exchange for nothing. The parameter carries which
+        // icon, and for an action, which one.
+        GSimpleAction* icon_action =
+            g_simple_action_new("icon-action", G_VARIANT_TYPE_STRING);
+        g_signal_connect(icon_action, "activate",
+                         G_CALLBACK(&DockEngine::on_icon_action_static), this);
+        g_action_map_add_action(G_ACTION_MAP(actions_), G_ACTION(icon_action));
+        g_object_unref(icon_action);
+
+        GSimpleAction* icon_close =
+            g_simple_action_new("icon-close", G_VARIANT_TYPE_STRING);
+        g_signal_connect(icon_close, "activate",
+                         G_CALLBACK(&DockEngine::on_icon_close_static), this);
+        g_action_map_add_action(G_ACTION_MAP(actions_), G_ACTION(icon_close));
+        g_object_unref(icon_close);
+
         gtk_widget_insert_action_group(window_, "dock", G_ACTION_GROUP(actions_));
 
         GMenu* menu = g_menu_new();
@@ -2837,10 +2856,150 @@ class DockEngine {
             return;
         }
 
+        // This gesture is on root_fixed_ in the CAPTURE phase, so it sees the
+        // press before any icon does. An icon with a menu of its own has to be
+        // allowed to answer, so the dock menu declines rather than claiming --
+        // which is the split the README described before either menu existed:
+        // the icons take the icons, and the dock keeps the background, the end
+        // caps and the separators.
+        if (const std::optional<std::size_t> index = self->icon_at(x)) {
+            if (self->show_icon_menu(*index, x, y)) {
+                gtk_gesture_set_state(GTK_GESTURE(gesture), GTK_EVENT_SEQUENCE_CLAIMED);
+                return;
+            }
+            // Nothing to show for this icon -- no actions, and either not
+            // running or nothing that can close it. Fall through to the dock's
+            // own menu rather than popping an empty one.
+        }
+
         const GdkRectangle at{static_cast<int>(x), static_cast<int>(y), 1, 1};
         gtk_popover_set_pointing_to(GTK_POPOVER(self->menu_), &at);
         gtk_popover_popup(GTK_POPOVER(self->menu_));
         gtk_gesture_set_state(GTK_GESTURE(gesture), GTK_EVENT_SEQUENCE_CLAIMED);
+    }
+
+    // Right-clicking an icon. Built per press rather than cached, because its
+    // contents depend on whether that application is running right now -- and a
+    // right-click is not a frame, so building a small GMenu costs nothing worth
+    // saving.
+    //
+    // Returns false when there would be nothing in it, and the dock's own menu
+    // is shown instead. An empty popover appearing where a menu was expected is
+    // worse than the general menu appearing.
+    bool show_icon_menu(std::size_t index, double x, double y) {
+        if (index >= icons_.size()) {
+            return false;
+        }
+        IconRuntime& icon = icons_[index];
+
+        // catalog(), not catalog_: the catalogue is lazy, and reading the
+        // member directly gets an empty map on the first right-click -- which
+        // looked exactly like "this application has no actions".
+        const DesktopCatalogEntry* entry = nullptr;
+        const auto& cat = catalog();
+        const auto it = cat.find(icon.desktop_id);
+        if (it != cat.end()) {
+            entry = &it->second;
+        }
+
+        const bool running = icon.is_open;
+        const bool can_close = running && toplevel_source_->can_close();
+        const bool has_actions = entry != nullptr && !entry->actions.empty();
+        if (!has_actions && !can_close) {
+            return false;
+        }
+
+        GMenu* menu = g_menu_new();
+
+        // The application's own entries, in the order it listed them. Not
+        // sorted: the order in Actions= is the application's opinion about
+        // which of its own options matters most, and it knows better than a
+        // dock does.
+        if (has_actions) {
+            GMenu* section = g_menu_new();
+            for (const auto& action : entry->actions) {
+                const std::string target = icon.desktop_id + "\x1f" + action.id;
+                GMenuItem* item = g_menu_item_new(action.name.c_str(), nullptr);
+                g_menu_item_set_action_and_target_value(
+                    item, "dock.icon-action", g_variant_new_string(target.c_str()));
+                g_menu_append_item(section, item);
+                g_object_unref(item);
+            }
+            g_menu_append_section(menu, nullptr, G_MENU_MODEL(section));
+            g_object_unref(section);
+        }
+
+        if (can_close) {
+            GMenu* section = g_menu_new();
+            GMenuItem* item = g_menu_item_new("Close", nullptr);
+            g_menu_item_set_action_and_target_value(
+                item, "dock.icon-close", g_variant_new_string(icon.app_id.c_str()));
+            g_menu_append_item(section, item);
+            g_object_unref(item);
+            g_menu_append_section(menu, nullptr, G_MENU_MODEL(section));
+            g_object_unref(section);
+        }
+
+        if (icon_menu_ != nullptr) {
+            gtk_widget_unparent(icon_menu_);
+            icon_menu_ = nullptr;
+        }
+        icon_menu_ = gtk_popover_menu_new_from_model(G_MENU_MODEL(menu));
+        g_object_unref(menu);
+        gtk_popover_set_has_arrow(GTK_POPOVER(icon_menu_), FALSE);
+        gtk_widget_set_halign(icon_menu_, GTK_ALIGN_START);
+        gtk_widget_set_parent(icon_menu_, root_fixed_);
+
+        const GdkRectangle at{static_cast<int>(x), static_cast<int>(y), 1, 1};
+        gtk_popover_set_pointing_to(GTK_POPOVER(icon_menu_), &at);
+        gtk_popover_popup(GTK_POPOVER(icon_menu_));
+        return true;
+    }
+
+    static void on_icon_action_static(GSimpleAction*, GVariant* parameter, gpointer user_data) {
+        auto* self = static_cast<DockEngine*>(user_data);
+        if (parameter == nullptr) {
+            return;
+        }
+        const std::string target = g_variant_get_string(parameter, nullptr);
+        const std::size_t sep = target.find('\x1f');
+        if (sep == std::string::npos) {
+            return;
+        }
+        const std::string desktop_id = target.substr(0, sep);
+        const std::string action_id = target.substr(sep + 1);
+
+        const auto& cat = self->catalog();
+        const auto it = cat.find(desktop_id);
+        if (it == cat.end()) {
+            return;
+        }
+        GDesktopAppInfo* info =
+            g_desktop_app_info_new_from_filename(it->second.desktop_path.c_str());
+        if (info == nullptr) {
+            return;
+        }
+        // GIO launches the action from the desktop file itself, so the Exec
+        // line, its field codes and its environment are handled the same way a
+        // file manager or a launcher would handle them -- rather than this dock
+        // inventing a second, worse parser for a format that already has one.
+        g_desktop_app_info_launch_action(info, action_id.c_str(), nullptr);
+        g_object_unref(info);
+    }
+
+    static void on_icon_close_static(GSimpleAction*, GVariant* parameter, gpointer user_data) {
+        auto* self = static_cast<DockEngine*>(user_data);
+        if (parameter == nullptr) {
+            return;
+        }
+        const char* app_id = g_variant_get_string(parameter, nullptr);
+        if (app_id == nullptr || *app_id == '\0') {
+            return;
+        }
+        // A request. The application may put up an unsaved-changes dialog, and
+        // the dot stays lit until the compositor says the window is gone --
+        // which is correct: it has not closed yet.
+        self->toplevel_source_->close_app(app_id);
     }
 
     static void on_magnification_action_static(GSimpleAction* action, GVariant* state,
@@ -3289,6 +3448,7 @@ window {
     // decaying, so the dock shrinks from the shape it had rather than snapping
     // flat and then easing nothing.
     std::optional<double> last_pointer_x_;
+    GtkWidget* icon_menu_ = nullptr;
     double envelope_ = 0.0;
     double envelope_velocity_ = 0.0;
 

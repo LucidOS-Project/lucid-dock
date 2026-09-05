@@ -893,6 +893,71 @@ target.
 widget exists. It opens the same file the settings application will write, so
 the entry point moves later without the plumbing under it changing.
 
+### The icon menu
+
+Right-click an icon and you get that application's own entries, plus Close when
+it is running.
+
+    New Window
+    New Incognito Window
+    ---------------------
+    Close
+
+**The entries are the application's, not the dock's.** They come from `Actions=`
+and the `[Desktop Action ...]` groups in its desktop file -- "New Window", "New
+Private Window", "Compose Message" -- and they are shown in the order the
+application listed them, because that order is its own opinion about which of
+its options matter and it knows better than a dock does. Launching one goes
+through `g_desktop_app_info_launch_action()`, so the Exec line, its field codes
+and its environment are handled the way a file manager would handle them rather
+than by this dock inventing a second, worse parser for a format that already has
+one.
+
+This is also the answer to the missing menu bar. GTK4 removed exported
+application menus and libadwaita puts them in a hamburger inside a client-side
+headerbar, so a global File/Edit/View bar cannot be built on an Ubuntu base.
+`Actions=` is a different thing that still works, because it is data in a file
+rather than a live D-Bus export.
+
+**Close made the dock a management client**, and that changed which protocol it
+asks for. `ext-foreign-toplevel-list-v1` has no close request: it is a *list*,
+split out precisely so that a client which only wants to display windows does
+not have to be trusted to act on them. Preferring it was right while the dock
+only ever displayed. The dock now asks lucid-wayland for `management`, which
+moves it to `wlr`.
+
+It closes every window of the application, because that is what an icon means --
+one icon is one application, so Close closes the application the way the macOS
+dock's Quit does. Closing only the focused window would leave the icon lit and
+the user pressing it again. And it is a **request**: the application may put up
+an unsaved-changes dialog, the dot stays lit until the compositor says the
+window is gone, and there is deliberately no forced kill. A dock that could
+destroy an unsaved document from a context menu would be a worse dock.
+
+**The dock's own menu keeps the background.** The dock gesture is on
+`root_fixed_` in the `CAPTURE` phase, so it sees the press before any icon does;
+it now declines when the press is over an icon rather than claiming it. Where an
+icon has nothing to offer -- no actions, and either not running or nothing that
+can close it -- it falls through to the dock menu rather than popping an empty
+popover.
+
+**Verified by driving a real pointer**, which took finding out that a *headless*
+sway has a seat with no pointer device at all: `swaymsg seat - cursor set`
+returns `success` and moves nothing, because `capabilities` is 0 and `devices`
+is empty. Nested inside the host session (`WLR_BACKENDS=wayland`) the seat has
+capabilities 3 and the clicks land. Every pointer-driven claim in this README
+needs that, and it is the difference between a test and a test-shaped script.
+
+Two bugs it found, both invisible to a compile:
+
+- `catalog_` is populated lazily by `catalog()`. Reading the member directly
+  returned an empty map on the first right-click, which looked exactly like "this
+  application has no actions" -- a wrong answer that is indistinguishable from a
+  right one.
+- The `CAPTURE`-phase dock gesture claimed the press before the icon could see
+  it, so the dock menu appeared over icons. That was the documented design
+  before either menu existed; it still had to be implemented.
+
 ### Separators
 
 From the reference: `apps-config.ts` has `dock_breaks_before` and `Dock.svelte`
