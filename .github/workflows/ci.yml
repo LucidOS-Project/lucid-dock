@@ -96,18 +96,26 @@ jobs:
       # is not a broken dock and should not look like one.
       - name: Supervised session (lucid-session + dock under sway)
         env:
-          LUCID_SESSION_TOKEN: ${{ secrets.LUCID_SESSION_TOKEN }}
+          LUCID_SESSION_DEPLOY_KEY: ${{ secrets.LUCID_SESSION_DEPLOY_KEY }}
         working-directory: macoswebproto
         run: |
-          if [ -z "$LUCID_SESSION_TOKEN" ]; then
-            echo "::notice::LUCID_SESSION_TOKEN not set -- skipping the supervised"\
-                 "session check. Create a fine-grained PAT with read access to"\
-                 "LucidOS-Project/lucid-session and add it as that secret to enable."
+          if [ -z "$LUCID_SESSION_DEPLOY_KEY" ]; then
+            echo "::notice::LUCID_SESSION_DEPLOY_KEY not set -- skipping the"\
+                 "supervised session check. See 'Enabling the supervised session"\
+                 "check' in the README."
             exit 0
           fi
-          git clone --depth 1 \
-            "https://x-access-token:$LUCID_SESSION_TOKEN@github.com/LucidOS-Project/lucid-session.git" \
-            /tmp/lucid-session
+          # A read-only deploy key rather than a personal access token: it can
+          # read exactly one repository and nothing else in the account, so the
+          # blast radius of this secret leaking is one private icon dock rather
+          # than everything the owner can reach.
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$LUCID_SESSION_DEPLOY_KEY" > ~/.ssh/lucid_session
+          chmod 600 ~/.ssh/lucid_session
+          ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
+          GIT_SSH_COMMAND="ssh -i ~/.ssh/lucid_session -o IdentitiesOnly=yes" \
+            git clone --depth 1 \
+              git@github.com:LucidOS-Project/lucid-session.git /tmp/lucid-session
           make -C /tmp/lucid-session
 
           export XDG_RUNTIME_DIR=/tmp/xdg-session

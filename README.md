@@ -1294,6 +1294,36 @@ concluding that the toolkit is the problem -- for reference, `foot`, a lean
 Wayland terminal in C, measures 10.6 MiB, so leaving GTK entirely would save
 roughly 35 MiB per surface.
 
+## Enabling the supervised session check
+
+CI's last step runs `lucid-session` supervising this dock under headless sway --
+the composition the LucidOS session is, which neither repository's own suite
+covers. `lucid-session` is private, and a workflow's built-in `GITHUB_TOKEN` can
+only read the repository it runs in, so the step needs a credential and skips
+with a notice until it has one.
+
+A **read-only deploy key**, not a personal access token: it can read exactly one
+repository and nothing else in the account, so a leak costs one private repo
+rather than everything the owner can reach. Four commands, once:
+
+    ssh-keygen -t ed25519 -N "" -C "lucid-dock-ci" -f /tmp/lucid-ci-key
+
+    gh api -X POST repos/LucidOS-Project/lucid-session/keys \
+      -f title="lucid-dock CI (read-only)" \
+      -f key="$(cat /tmp/lucid-ci-key.pub)" \
+      -F read_only=true
+
+    gh secret set LUCID_SESSION_DEPLOY_KEY \
+      --repo LucidOS-Project/lucid-dock < /tmp/lucid-ci-key
+
+    rm /tmp/lucid-ci-key /tmp/lucid-ci-key.pub
+
+The step then asserts what a passing run has to *mean*, rather than that it
+exited zero: the anchored path was taken, the toplevel source was event-driven
+rather than the `proc` fallback, the supervisor reported a healthy start in its
+own words, and **nothing was quarantined** -- a green run that had set the user's
+configuration aside is a failure wearing a success.
+
 ## Why out-of-process
 
 The dock is a separate process from the compositor on purpose. A dock that
