@@ -777,6 +777,10 @@ class DockEngine {
             ensure_tick();
         }
 
+        // Armed before the window is shown, so the first frame the compositor
+        // presents is already the off-screen one.
+        arm_intro();
+
         gtk_window_present(GTK_WINDOW(window_));
     }
 
@@ -787,14 +791,38 @@ class DockEngine {
     // dock arrives already half way up.
     static void on_map_static(GtkWidget*, gpointer user_data) {
         auto* self = static_cast<DockEngine*>(user_data);
-        self->begin_intro();
         self->queue_layout();
     }
 
-    void begin_intro() {
-        if (intro_played_ || g_getenv("LUCID_DOCK_NO_INTRO") != nullptr) {
+    // Arm the slide: put the dock off-screen, but do not start its clock.
+    //
+    // Called before the window is presented, because the first frame the
+    // compositor shows has to already be the off-screen one. Arming it later
+    // means one frame drawn at rest followed by a jump downwards, which is a
+    // flicker rather than an entrance.
+    void arm_intro() {
+        if (g_getenv("LUCID_DOCK_NO_INTRO") != nullptr || bench_total_ > 0) {
+            intro_played_ = true;   // benchmarks measure the steady state
             return;
         }
+        intro_offset_ = intro_travel();
+        intro_pending_ = true;
+    }
+
+    // Start its clock, on the first frame the frame clock actually drives.
+    //
+    // This used to run from "map", and that is why the slide could not be seen
+    // on either sway or GNOME: under layer-shell, map fires when the widget is
+    // mapped, which is before the compositor has configured and presented the
+    // surface. The whole 300 ms elapsed while there was nothing on screen, and
+    // the dock appeared already at rest. A tick callback only runs once the
+    // frame clock is live, which is as close to "the first frame anyone can
+    // see" as GTK will say out loud.
+    void begin_intro() {
+        if (intro_played_ || !intro_pending_) {
+            return;
+        }
+        intro_pending_ = false;
         // The benchmark measures the steady state. Letting the dock slide
         // through the first 300 ms of it would put an 18-frame layout storm in
         // the sample and quietly move every number in the report.
@@ -806,6 +834,19 @@ class DockEngine {
         intro_started_at_ = monotonic_seconds();
         intro_offset_ = intro_travel();
         ensure_tick();
+    }
+
+    // Overridable so the animation can be slowed down enough to confirm it is
+    // happening at all. 300 ms of a subtle vertical move is easy to miss, and
+    // "I cannot see it" and "it is not running" look identical from outside.
+    static double intro_duration() {
+        if (const char* ms = g_getenv("LUCID_DOCK_INTRO_MS")) {
+            const double seconds = atof(ms) / 1000.0;
+            if (seconds > 0.0) {
+                return seconds;
+            }
+        }
+        return INTRO_DURATION;
     }
 
     // Far enough to be entirely off-screen before it starts: the drawn panel's
@@ -821,7 +862,7 @@ class DockEngine {
         if (!intro_started_at_.has_value()) {
             return false;
         }
-        const double progress = (now - *intro_started_at_) / INTRO_DURATION;
+        const double progress = (now - *intro_started_at_) / intro_duration();
         if (progress >= 1.0) {
             intro_started_at_.reset();
             intro_offset_ = 0.0;
@@ -1436,6 +1477,10 @@ class DockEngine {
         const double now = monotonic_seconds();
         const double dt = last_tick_at_ > 0.0 ? std::min(0.1, now - last_tick_at_) : 1.0 / 60.0;
         last_tick_at_ = now;
+
+        // The frame clock is running, so frames are being produced. That is
+        // the moment to start the slide's clock -- see begin_intro().
+        begin_intro();
 
         bool animations_running = false;
 
@@ -2768,9 +2813,10 @@ window {
     bool tooltip_up_ = false;
     double tooltip_fade_started_at_ = 0.0;
     guint tooltip_fade_timer_ = 0;
-    // Once only. "map" fires again on every unhide, and a dock that re-enacts
-    // its entrance every time it is shown is a dock with a stutter.
+    // Once only. A dock that re-enacts its entrance every time it is shown is
+    // a dock with a stutter.
     bool intro_played_ = false;
+    bool intro_pending_ = false;
     int tooltip_w_ = -1;   // cached natural size; -1 means re-measure
     int tooltip_h_ = 0;
     std::optional<std::size_t> hovered_index_;
