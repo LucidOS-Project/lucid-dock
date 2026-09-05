@@ -16,13 +16,15 @@ Comment:
 
 Files: macoswebproto/third_party/lucid-tokens/*
 Copyright: 2026 Javid Medina
-License: MIT
+License: LGPL-2.1+
 Comment:
  The LucidOS configuration model, compiled into this binary rather than linked
- as a shared library. Deliberately MIT while the dock is GPL-3+: the dock is an
- end-user program, and the resolver is the piece that is only worth anything if
- other people adopt it. MIT is compatible with the GPL, so the combined work is
- distributable under the GPL-3+ that covers the dock.
+ as a shared library. Deliberately LGPL-2.1+ while the dock is GPL-3+: the dock
+ is an end-user program that nothing links, and the resolver is the piece that
+ is only worth anything if other projects adopt it. LGPL-2.1+ is compatible with
+ the GPL, so the combined work is distributable under the GPL-3+ covering the
+ dock, while the resolver on its own remains adoptable by projects that are not
+ GPL.
 
 Files: macoswebproto/protocols/*
 Copyright: 2018 Ilia Bozhinov
@@ -65,3 +67,16 @@ License: MIT
  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  SOFTWARE.
+
+License: LGPL-2.1+
+ This library is free software; you can redistribute it and/or modify it under
+ the terms of the GNU Lesser General Public License as published by the Free
+ Software Foundation; either version 2.1 of the License, or (at your option) any
+ later version.
+ .
+ This library is distributed in the hope that it will be useful, but WITHOUT ANY
+ WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+ PARTICULAR PURPOSE. See the GNU Lesser General Public License for more details.
+ .
+ On Debian systems the full text of the GNU Lesser General Public License
+ version 2.1 can be found in /usr/share/common-licenses/LGPL-2.1.
