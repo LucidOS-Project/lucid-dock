@@ -991,6 +991,17 @@ applications draws no icons, costs almost nothing, and passes any budget. CI
 reported -55.3, then 0.0, then 0.6 MiB, and only the first was obviously wrong
 at a glance.
 
+**The Wayland buffer pool is excluded.** GDK allocates its shm buffers as
+`/memfd:gdk-wayland` mappings, and how many it retains depends on the renderer
+and on how fast the machine is -- a slow machine has more frames in flight, so
+the pool grows and does not shrink back. A CI runner held ten of them at
+~1.3 MiB each against this machine's one, and that 13 MiB has nothing to do
+with the dock's code. It only lands in process memory at all because the check
+forces the cairo renderer; the shipping GL path keeps those buffers on the GPU.
+Excluding them is the same judgement already made about the driver:
+framebuffers are the renderer's business, and this budget is on what the dock
+itself allocates.
+
 **PSS, not RSS.** RSS charges the dock for every shared library page in full
 whether or not anything else maps them. PSS divides shared pages by the number
 of processes mapping them and is the only figure that adds up across a session.

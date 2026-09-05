@@ -104,8 +104,24 @@ EOF
 gcc -O2 -o "$WORK/floor" "$WORK/floor.c" $(pkg-config --cflags --libs gtk4) || {
     echo "FAIL: could not build the floor probe" >&2; exit 1; }
 
+# PSS, excluding the Wayland buffer pool.
+#
+# GDK allocates its shm buffers as /memfd:gdk-wayland mappings, and how many it
+# keeps depends on the renderer and on how fast the machine is: a slow machine
+# has more frames in flight, so the pool grows and does not shrink back. A CI
+# runner held ten of them at ~1.3 MiB against this machine's one, which is
+# 13 MiB of difference that has nothing to do with the dock's code -- and it
+# only lands in process memory at all because this check forces the cairo
+# renderer. The shipping GL path keeps those buffers on the GPU.
+#
+# Excluding them is the same judgement already made about the GPU driver:
+# framebuffers are the renderer's business, and the budget is on what the dock
+# itself allocates. Uses smaps rather than smaps_rollup because the rollup
+# cannot be filtered.
 pss_of() {
-    awk '/^Pss:/{p+=$2} END{if (p) printf "%.1f", p/1024}' "/proc/$1/smaps_rollup" 2>/dev/null
+    awk '/^[0-9a-f]/ { skip = (index($6, "gdk-wayland") > 0) }
+         /^Pss:/     { if (!skip) p += $2 }
+         END         { if (p) printf "%.1f", p/1024 }' "/proc/$1/smaps" 2>/dev/null
 }
 
 # Runs one binary under its own headless compositor and reports steady-state
