@@ -235,7 +235,7 @@ EOF
     done
     if [ -z "$pid" ]; then
         echo "FAIL: $procname never started under headless sway" >&2
-        cat "$WORK/sway.log" >&2; cat "$WORK/$procname.log" 2>/dev/null >&2
+        cat "$WORK/sway.log" >&2; cat "$WORK/$procname.log" >&2 2>/dev/null
         kill "$SWAY_PID" 2>/dev/null; SWAY_PID=""
         return 1
     fi
@@ -250,6 +250,13 @@ EOF
         fi
     done
     printf "  %-34s %8s MiB PSS (peak %s)\n" "$procname settled at" "$last" "$peak" >&2
+
+    # Where the memory is, captured while the process is still alive. Without
+    # this a failure on a machine you cannot log into is just a number, and the
+    # only way to find out what grew is to guess and push again.
+    awk '/^[0-9a-f]/ { name = ($6 == "") ? "[anon]" : $6 }
+         /^Pss:/     { if ($2 > 256) printf "%8.2f MiB  %s\n", $2/1024, name }' \
+        "/proc/$pid/smaps" 2>/dev/null | sort -rn | head -12 > "$WORK/$procname.smaps"
 
     kill "$pid" 2>/dev/null
     kill "$SWAY_PID" 2>/dev/null; wait "$SWAY_PID" 2>/dev/null; SWAY_PID=""
@@ -302,6 +309,10 @@ if false; then
     printf "  %-34s %8s MiB PSS\n" "lucid_dock_cpp" "$dock"
     printf "  %-34s %8s MiB\n"     "the dock's own cost" "$delta"
     echo
+    echo "Where the dock's memory is:" >&2
+    sed "s/^/    /" "$WORK/lucid_dock_cpp.smaps" >&2 2>/dev/null
+    echo "Where an empty GTK4 window's memory is, for comparison:" >&2
+    sed "s/^/    /" "$WORK/floor.smaps" >&2 2>/dev/null
     echo "The dock's log:" >&2
     sed "s/^/    /" "$WORK/lucid_dock_cpp.log" >&2
     echo "FAIL: the dock measured $delta MiB above an empty GTK4 window." >&2
@@ -320,6 +331,10 @@ printf "  %-34s %8s MiB\n"     "budget, on the absolute" "$BUDGET_MIB"
 echo
 
 if [ "$over" = "yes" ]; then
+    echo "Where the dock's memory is:" >&2
+    sed "s/^/    /" "$WORK/lucid_dock_cpp.smaps" >&2 2>/dev/null
+    echo "Where an empty GTK4 window's memory is, for comparison:" >&2
+    sed "s/^/    /" "$WORK/floor.smaps" >&2 2>/dev/null
     echo "FAIL: the dock costs $dock MiB PSS, over the $BUDGET_MIB MiB budget." >&2
     echo "Either find what grew, or raise LUCID_MEM_BUDGET with a reason in the commit message." >&2
     exit 1
