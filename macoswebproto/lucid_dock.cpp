@@ -3285,10 +3285,24 @@ class DockEngine {
         last_icon_scale_ = 0;
     }
 
-    // Empty IconTheme means "whatever the desktop is set to", which is what a
-    // dock should do by default. Setting it overrides that for this process
-    // only -- the dock does not reach into the user's desktop settings to get
-    // the icons it wants.
+    // Three answers, in order: dock.conf's IconTheme, then the
+    // desktop.icon-theme token, then whatever the desktop itself is set to.
+    //
+    // The token is what makes a LucidOS session use Lucid icons without the
+    // standalone dock imposing them on a KDE or sway desktop that never asked:
+    // the key is empty by default and set to Lucid in LucidOS's *distro* layer,
+    // so the same binary does the right thing in both places and the settings
+    // page can say which layer decided.
+    //
+    // It sits below dock.conf because dock.conf is the more specific statement
+    // -- someone who named a theme for the dock meant the dock -- and above the
+    // desktop's own setting, which is the fallback rather than the answer.
+    //
+    // Note this is *not* the same mechanism as the session's gtk settings.ini.
+    // That one sets the theme for every GTK application; GTK prefers a settings
+    // portal over settings.ini when one is reachable, so a LucidOS session
+    // nested inside another desktop still sees the host's theme. This token is
+    // read directly and is not subject to that.
     void apply_icon_theme() {
         GdkDisplay* display = window_ != nullptr ? gtk_widget_get_display(window_)
                                                  : gdk_display_get_default();
@@ -3297,7 +3311,14 @@ class DockEngine {
         }
         GtkIconTheme* desktop_theme = gtk_icon_theme_get_for_display(display);
 
-        if (config_.icon_theme.empty()) {
+        std::string wanted = config_.icon_theme;
+        const char* wanted_source = "dock.conf";
+        if (wanted.empty() && tokens_ != nullptr) {
+            wanted = tokens_->get_string("desktop.icon-theme");
+            wanted_source = "desktop.icon-theme";
+        }
+
+        if (wanted.empty()) {
             const char* name =
                 desktop_theme != nullptr ? gtk_icon_theme_get_theme_name(desktop_theme) : nullptr;
             g_message("icon theme: %s (from the desktop)", name != nullptr ? name : "(none)");
@@ -3320,7 +3341,7 @@ class DockEngine {
                 g_strfreev(path);
             }
         }
-        gtk_icon_theme_set_theme_name(icon_theme_, config_.icon_theme.c_str());
+        gtk_icon_theme_set_theme_name(icon_theme_, wanted.c_str());
 
         // Ask whether it actually resolved, rather than whether it was set:
         // GTK falls back to hicolor for a theme that is not installed and says
@@ -3336,7 +3357,7 @@ class DockEngine {
             icon_theme_ = nullptr;
             return;
         }
-        g_message("icon theme: %s (from dock.conf)", config_.icon_theme.c_str());
+        g_message("icon theme: %s (from %s)", wanted.c_str(), wanted_source);
     }
 
     GtkIconTheme* lookup_theme() {
