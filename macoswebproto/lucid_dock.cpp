@@ -2404,7 +2404,22 @@ void on_activate(GtkApplication* app, gpointer) {
 
 }  // namespace
 
+#ifndef LUCID_BUILD_STAMP
+#define LUCID_BUILD_STAMP "unknown"
+#endif
+#ifndef LUCID_GIT_REV
+#define LUCID_GIT_REV "unknown"
+#endif
+
 int main(int argc, char** argv) {
+    // Printed unconditionally. Knowing which build is running has repeatedly
+    // been the difference between a real measurement and a wasted afternoon,
+    // and it costs one line of output.
+    g_message("lucid-dock %s built %s", LUCID_GIT_REV, LUCID_BUILD_STAMP);
+    if (argc > 1 && (g_strcmp0(argv[1], "--version") == 0)) {
+        return 0;
+    }
+
     // Renderer choice has to happen before GTK initialises, which is before the
     // dock reads anything else, so this reads the config file directly rather
     // than going through the engine. g_setenv with overwrite=FALSE so an
