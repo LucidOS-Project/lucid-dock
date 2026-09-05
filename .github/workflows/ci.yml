@@ -178,12 +178,18 @@ jobs:
           if objdump -x /tmp/debroot/usr/bin/lucid-dock | grep -E 'RUNPATH|RPATH'; then
             echo "the packaged binary carries an rpath"; exit 1
           fi
+          # dpkg-buildpackage writes to the parent directory by design, and
+          # upload-artifact refuses a path containing '..', so the results are
+          # moved inside the workspace rather than reached for outside it.
+          mkdir -p dist && mv ../lucid-dock_*.deb ../lucid-dock_*.buildinfo \
+            ../lucid-dock_*.changes dist/ 2>/dev/null || true
+          ls -la dist
 
       - name: Upload the package
         uses: actions/upload-artifact@v4
         with:
           name: lucid-dock-deb
-          path: ../lucid-dock_*.deb
+          path: dist/
           if-no-files-found: error
 
       - name: Upload logs on failure

@@ -14,3 +14,4 @@ debian/debhelper-build-stamp
 obj-*-linux-gnu/
 debian/*.debhelper.log
 debian/*.debhelper
+dist/
