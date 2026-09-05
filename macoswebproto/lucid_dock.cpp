@@ -20,6 +20,7 @@
 #include <fstream>
 #include <map>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <unordered_set>
@@ -139,6 +140,10 @@ constexpr double BOUNCE_DURATION = 0.4;
 // cannot match to a process -- stops bouncing rather than bouncing forever.
 constexpr double LAUNCH_TIMEOUT = 20.0;
 constexpr unsigned LAUNCH_POLL_MS = 400;
+
+// A frame at 60 Hz is 16.7 ms, so anything approaching a millisecond off the
+// frame clock is worth naming.
+constexpr gint64 SLOW_WORK_US = 1000;
 
 // How far the pointer must travel before a press becomes a drag rather than a
 // click. Below this the button still gets its click.
@@ -284,10 +289,38 @@ std::filesystem::path find_icon_in_lucid_theme(const std::string& icon_name) {
 // What to pin when there is no config file and no GNOME to borrow from. One
 // entry per role, first match wins, anything not installed is skipped -- so
 // this produces a short, sane dock on KDE or sway rather than an empty one.
+using CandidateCache = std::map<std::string, std::vector<std::string>>;
+
 std::vector<DesktopApp> load_dock_apps(const DockConfig& config,
-                                       const std::map<std::string, DesktopCatalogEntry>& catalog) {
+                                       const std::map<std::string, DesktopCatalogEntry>& catalog,
+                                       const CandidateCache* cache = nullptr,
+                                       const std::unordered_set<std::string>* running = nullptr) {
+    // exec_candidates() is a pure function of the entry, so on the hot path it
+    // comes from the cache the engine keeps beside the catalog.
+    // Returns a reference on the cached path: this runs once per catalog entry
+    // per tick, and copying a vector of strings 65 times is not free.
+    std::vector<std::string> scratch;
+    auto candidates_for = [&](const std::string& desktop_id,
+                              const DesktopCatalogEntry& entry) -> const std::vector<std::string>& {
+        if (cache != nullptr) {
+            const auto it = cache->find(desktop_id);
+            if (it != cache->end()) {
+                return it->second;
+            }
+        }
+        scratch = exec_candidates(entry.exec_line, desktop_id);
+        return scratch;
+    };
     const auto& favorites = config.pinned;
-    const auto running_names = collect_running_process_names();
+
+    // Scanning /proc costs ~11 ms. The caller usually has just done it, so it
+    // is passed in rather than repeated -- refresh_running_indicators() scanned
+    // /proc and then called this, which scanned it again, twice per tick.
+    std::unordered_set<std::string> scanned;
+    if (running == nullptr) {
+        scanned = collect_running_process_names();
+    }
+    const std::unordered_set<std::string>& running_names = running != nullptr ? *running : scanned;
 
     std::vector<DesktopApp> apps;
     apps.reserve(favorites.size());
@@ -300,7 +333,7 @@ std::vector<DesktopApp> load_dock_apps(const DockConfig& config,
 
         const DesktopCatalogEntry& entry = it->second;
         const std::string app_id = std::filesystem::path(desktop_id).stem().string();
-        const auto candidates = exec_candidates(entry.exec_line, desktop_id);
+        const auto& candidates = candidates_for(desktop_id, entry);
 
         const bool is_open = std::any_of(candidates.begin(), candidates.end(), [&](const std::string& candidate) {
             return running_names.find(candidate) != running_names.end();
@@ -358,7 +391,7 @@ std::vector<DesktopApp> load_dock_apps(const DockConfig& config,
             continue;
         }
 
-        const auto candidates = exec_candidates(entry.exec_line, desktop_id);
+        const auto& candidates = candidates_for(desktop_id, entry);
         if (candidates.empty()) {
             continue;
         }
@@ -1081,6 +1114,56 @@ class DockEngine {
         return static_cast<double>(v[i]) / 1000.0;
     }
 
+    // Anything that runs off a timer rather than off the frame clock is
+    // invisible to a frame-time percentile: it fires a handful of times across
+    // a run, so it hides in the tail. Timing each one by name says which.
+    struct WorkStat {
+        gint64 calls = 0;
+        gint64 total_us = 0;
+        gint64 max_us = 0;
+    };
+
+    void record_work(const char* name, gint64 us) {
+        WorkStat& stat = work_[name];
+        stat.calls += 1;
+        stat.total_us += us;
+        stat.max_us = std::max(stat.max_us, us);
+
+        // Also complain in real time. A stall only shows up in the benchmark
+        // if it happens to fire during the run, and the 4 s timer usually does
+        // not.
+        if (us >= SLOW_WORK_US && g_getenv("LUCID_DOCK_TIMERS") != nullptr) {
+            g_message("slow: %s took %.2f ms", name, static_cast<double>(us) / 1000.0);
+        }
+    }
+
+    // Scoped timer. Declaring one times the enclosing block.
+    class ScopedWork {
+      public:
+        ScopedWork(DockEngine* engine, const char* name)
+            : engine_(engine), name_(name), start_(g_get_monotonic_time()) {}
+        ~ScopedWork() { engine_->record_work(name_, g_get_monotonic_time() - start_); }
+
+      private:
+        DockEngine* engine_;
+        const char* name_;
+        gint64 start_;
+    };
+
+    void report_work() {
+        if (work_.empty()) {
+            return;
+        }
+        g_print("\noff-frame work (timers, not the frame clock)\n");
+        g_print("  %-34s %6s %10s %10s\n", "what", "calls", "mean ms", "max ms");
+        for (const auto& [name, stat] : work_) {
+            g_print("  %-34s %6ld %10.3f %10.3f\n", name.c_str(),
+                    static_cast<long>(stat.calls),
+                    stat.calls ? (static_cast<double>(stat.total_us) / stat.calls) / 1000.0 : 0.0,
+                    static_cast<double>(stat.max_us) / 1000.0);
+        }
+    }
+
     void bench_report() {
         g_print("\n--- lucid-dock frame benchmark ---\n");
         g_print("window           : %dx%d logical\n",
@@ -1109,6 +1192,7 @@ class DockEngine {
         if (p50 > 0.0) {
             g_print("effective fps    : %.1f (p50)\n", 1000.0 / p50);
         }
+        report_work();
         g_print("---------------------------------\n");
         g_application_quit(G_APPLICATION(gtk_window_get_application(GTK_WINDOW(window_))));
     }
@@ -1778,7 +1862,43 @@ class DockEngine {
     }
 
     void refresh_running_indicators() {
-        const auto running = collect_running_process_names();
+        ScopedWork timer(this, "refresh_running_indicators");
+        std::unordered_set<std::string> running;
+        {
+            ScopedWork inner(this, "  collect_running_process_names");
+            running = collect_running_process_names();
+        }
+
+        // Compare only the names the dock could possibly care about. The raw
+        // /proc set churns every few seconds -- short-lived helpers, workers,
+        // shells -- so comparing it wholesale almost never matches and the
+        // skip never fires. The set of *our* candidates that are running is
+        // stable, because it only changes when an application the dock can show
+        // starts or stops.
+        std::set<std::string> relevant;
+        ScopedWork relevant_timer(this, "  match relevant candidates");
+        for (const auto& [desktop_id, candidates] : candidates()) {
+            for (const auto& candidate : candidates) {
+                if (running.find(candidate) != running.end()) {
+                    relevant.insert(candidate);
+                    break;
+                }
+            }
+        }
+        if (relevant == last_relevant_) {
+            return;
+        }
+        if (g_getenv("LUCID_DOCK_TIMERS") != nullptr && !last_relevant_.empty()) {
+            std::string added, removed;
+            for (const auto& r : relevant) {
+                if (!last_relevant_.count(r)) { added += r; added += " "; }
+            }
+            for (const auto& r : last_relevant_) {
+                if (!relevant.count(r)) { removed += r; removed += " "; }
+            }
+            g_message("running set changed: +[%s] -[%s]", added.c_str(), removed.c_str());
+        }
+        last_relevant_ = std::move(relevant);
         for (auto& icon : icons_) {
             bool is_open = false;
             for (const auto& name : icon.process_candidates) {
@@ -1798,7 +1918,7 @@ class DockEngine {
         }
 
         if (config_.show_running) {
-            sync_running_items();
+            sync_running_items(running);
         }
     }
 
@@ -1806,11 +1926,38 @@ class DockEngine {
     // a rebuild. Comparing the set first matters: rebuilding unconditionally
     // every four seconds would restart every animation and make the dock twitch
     // on a timer.
-    void sync_running_items() {
-        const auto catalog = load_desktop_catalog();
+    void reload_catalog() {
+        ScopedWork timer(this, "reload_catalog");
+        catalog_ = load_desktop_catalog();
+        candidates_.clear();
+        for (const auto& [desktop_id, entry] : catalog_) {
+            candidates_[desktop_id] = exec_candidates(entry.exec_line, desktop_id);
+        }
+    }
+
+    const std::map<std::string, DesktopCatalogEntry>& catalog() {
+        if (catalog_.empty()) {
+            reload_catalog();
+        }
+        return catalog_;
+    }
+
+    const std::map<std::string, std::vector<std::string>>& candidates() {
+        if (catalog_.empty()) {
+            reload_catalog();
+        }
+        return candidates_;
+    }
+
+    void sync_running_items(const std::unordered_set<std::string>& running) {
+        ScopedWork timer(this, "sync_running_items");
+
         std::vector<std::string> want;
-        for (const auto& app : load_dock_apps(config_, catalog)) {
-            want.push_back(app.desktop_path.filename().string());
+        {
+            ScopedWork inner(this, "  load_dock_apps");
+            for (const auto& app : load_dock_apps(config_, catalog(), &candidates_, &running)) {
+                want.push_back(app.desktop_path.filename().string());
+            }
         }
 
         std::vector<std::string> have;
@@ -2080,6 +2227,11 @@ class DockEngine {
     }
 
     void rebuild_items() {
+        ScopedWork timer(this, "rebuild_items");
+        rebuild_items_impl();
+    }
+
+    void rebuild_items_impl() {
         for (auto& icon : icons_) {
             if (icon.divider != nullptr) {
                 gtk_fixed_remove(GTK_FIXED(panel_fixed_), icon.divider);
@@ -2089,8 +2241,7 @@ class DockEngine {
         icons_.clear();
         last_applied_pixel_widths_.clear();
 
-        const auto catalog = load_desktop_catalog();
-        build_icons(load_dock_apps(config_, catalog));
+        build_icons(load_dock_apps(config_, catalog(), &candidates_));
         last_icon_scale_ = 0;
     }
 
@@ -2191,6 +2342,19 @@ window {
     GSimpleActionGroup* actions_ = nullptr;
     GFileMonitor* config_monitor_ = nullptr;
     guint launch_poll_id_ = 0;
+    std::map<std::string, WorkStat> work_;
+
+    // Parsing 148 .desktop files costs ~15 ms. The set of installed
+    // applications does not change between two ticks of a 4 s timer, so read it
+    // once and reuse it. reload_catalog() exists for when it genuinely changes;
+    // nothing calls it on a timer.
+    std::map<std::string, DesktopCatalogEntry> catalog_;
+
+    // exec_candidates() over the whole catalog is another ~8 ms, and it is a
+    // pure function of the entry, so it is cached beside the catalog and
+    // invalidated with it.
+    std::map<std::string, std::vector<std::string>> candidates_;
+    std::set<std::string> last_relevant_;
 
     std::optional<std::size_t> drag_from_;
     double drag_origin_x_ = 0.0;
