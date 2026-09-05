@@ -909,16 +909,30 @@ the user in the same way 60 fps is -- and it regresses the same way, quietly,
 in a commit about something else. `tests/check_memory_budget.sh` is the check
 that makes that loud, and CI runs it.
 
-Measured under headless sway, so these are the anchored path:
+Measured under headless sway with `GSK_RENDERER=cairo`, so the graphics driver
+is excluded from both sides:
 
 | | PSS |
 |---|---|
-| An empty GTK4 window | 34.6 MiB |
-| `lucid_dock_cpp` | 44.2 MiB |
-| **the dock's own cost** | **9.6 MiB** |
+| An empty GTK4 window | 11.9 MiB |
+| `lucid_dock_cpp` | 18.5 MiB |
+| **the dock's own cost** | **6.6 MiB** |
 
-Repeatable to 0.1 MiB across runs. Three decisions make that number mean
-something:
+Repeatable to 0.1 MiB. Four decisions make that number mean something:
+
+**The graphics driver is excluded, on purpose.** With the GL renderer the
+figure is at the mercy of the driver: on a machine with a GPU the framebuffers
+live in GPU memory and never appear in PSS, and on a machine without one --
+every CI runner -- GTK falls back to llvmpipe and those same framebuffers
+become ordinary process memory counted in full. The first CI run measured the
+floor at 226 MiB against the dock's 171 for exactly that reason and reported
+the dock as costing *minus 55 MiB*, which it passed. Rendering both probes
+through cairo leaves behind what the check is for: the dock's own allocations.
+
+**So this is a regression signal, not what a user pays.** The shipped GL path
+costs about 44 MiB total and 9.6 MiB over the floor on a machine with a GPU.
+Those are the user-facing numbers; the 6.6 MiB is the one that can be compared
+across machines.
 
 **PSS, not RSS.** RSS charges the dock for every shared library page in full,
 whether or not anything else maps them. PSS divides shared pages by the number

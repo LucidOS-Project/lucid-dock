@@ -23,21 +23,42 @@
 #   being told about. The absolute is still printed, because it is what a user
 #   actually pays.
 #
-# Runs under a headless nested compositor so it needs no display, no GPU and no
+# Both probes render with GSK_RENDERER=cairo, which is pure software and never
+# opens a GL context. That is deliberate and it is the difference between a
+# check that works and one that does not.
+#
+# With the GL renderer the number is at the mercy of the graphics driver. On a
+# machine with a GPU the framebuffers live in GPU memory and never appear in
+# PSS; on a machine without one -- every CI runner -- GTK falls back to
+# llvmpipe and those same framebuffers become ordinary process memory that
+# lands in PSS in full. The first CI run measured the floor at 226 MiB against
+# the dock's 171 for exactly that reason, and reported the dock as costing
+# minus 55 MiB.
+#
+# Excluding the driver from both sides makes the measurement portable and
+# leaves behind what the check is actually for: the dock's own allocations,
+# its icons, its widgets, its data structures. That is the thing this project
+# controls and the thing that regresses.
+#
+# What it therefore does NOT measure is what a user pays. The shipped GL path
+# costs more -- about 44 MiB total and 9.6 MiB over the floor on a development
+# machine with a GPU. This is a regression signal, not a user-facing figure.
+#
+# Runs under a headless nested compositor so it needs no display and no
 # layer-shell support from the host session -- which also means it measures the
-# anchored path, not GNOME's unanchored fallback. Those differ by ~35 MiB, so
-# the environment is part of the measurement.
+# anchored path, not GNOME's unanchored fallback.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
 # MiB of PSS the dock may cost above an empty GTK4 window. Raise this only with
 # a measurement and a reason in the commit message.
 #
-# Measured 9.6-9.7 MiB, repeatable to 0.1 MiB across runs. Set at 15 so the
-# check has room for a machine whose built-in default pinned list resolves to
-# more applications -- icon rasterisation is most of this number -- without
-# leaving room for a regression to hide in. A doubling fails; noise does not.
-BUDGET_MIB=${LUCID_MEM_BUDGET:-15}
+# Measured 6.6 MiB with the cairo renderer. Set at 10 so there is room for a
+# machine whose built-in default pinned list resolves to more applications --
+# icon rasterisation is most of this number -- without leaving room for a
+# regression to hide in. A doubling of the dock's own cost fails; noise does
+# not.
+BUDGET_MIB=${LUCID_MEM_BUDGET:-10}
 
 WORK=$(mktemp -d)
 SWAY_PID=""
@@ -105,7 +126,7 @@ measure() {
     # that was being asked about.
     cat > "$WORK/sway.cfg" <<EOF
 output HEADLESS-1 resolution 1920x323
-exec_always env XDG_CONFIG_HOME=$WORK/config $binary > $WORK/$procname.log 2>&1
+exec_always env XDG_CONFIG_HOME=$WORK/config GSK_RENDERER=cairo $binary > $WORK/$procname.log 2>&1
 EOF
     mkdir -p "$WORK/config"
     WLR_BACKENDS=headless sway -c "$WORK/sway.cfg" > "$WORK/sway.log" 2>&1 &
@@ -135,7 +156,7 @@ EOF
     echo "$peak"
 }
 
-echo "Measuring under headless sway (anchored layer-shell path)..."
+echo "Measuring under headless sway, GSK_RENDERER=cairo (driver excluded)..."
 floor=$(measure "$WORK/floor" floor) || exit 1
 dock=$(measure "$PWD/lucid_dock_cpp" lucid_dock_cpp) || exit 1
 
