@@ -53,12 +53,12 @@ cd "$(dirname "$0")/.."
 # MiB of PSS the dock may cost above an empty GTK4 window. Raise this only with
 # a measurement and a reason in the commit message.
 #
-# Measured 6.6 MiB with the cairo renderer. Set at 10 so there is room for a
-# machine whose built-in default pinned list resolves to more applications --
-# icon rasterisation is most of this number -- without leaving room for a
-# regression to hide in. A doubling of the dock's own cost fails; noise does
-# not.
-BUDGET_MIB=${LUCID_MEM_BUDGET:-10}
+# Measured 8.5 MiB against the eight-icon fixture below, with the cairo
+# renderer, repeatable to 0.1 MiB. Set at 13: enough headroom that a different
+# Adwaita release rasterising slightly heavier icons does not fail the build,
+# not enough for a regression to hide in. A doubling of the dock's own cost
+# fails; noise does not.
+BUDGET_MIB=${LUCID_MEM_BUDGET:-13}
 
 WORK=$(mktemp -d)
 SWAY_PID=""
@@ -102,6 +102,40 @@ pss_of() {
 # before it settles is not the number a user lives with.
 measure() {
     local binary="$1" procname="$2" peak=0 sample
+    # A fixture of its own: eight synthetic applications with stock Adwaita
+    # icon names, and a config that pins exactly those.
+    #
+    # Without it the check measures whatever happens to be installed. On a bare
+    # CI runner almost nothing is, so builtin_default_pinned() found no
+    # applications, the dock drew no icons at all, and it measured byte for
+    # byte the same as an empty window -- 17.4 MiB against 17.4 MiB. Icon
+    # rasterisation is most of what the dock's own memory is, so a dock with no
+    # icons is not a smaller dock, it is a different program.
+    mkdir -p "$WORK/config/lucid" "$WORK/data/applications"
+    local pinned="" i=0
+    for icon in folder text-x-generic image-x-generic audio-x-generic \
+                video-x-generic application-x-executable font-x-generic package-x-generic; do
+        i=$((i + 1))
+        cat > "$WORK/data/applications/lucid-memtest-$i.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Mem Test $i
+Exec=/bin/true
+Icon=$icon
+EOF
+        pinned="$pinned lucid-memtest-$i.desktop;"
+    done
+    cat > "$WORK/config/lucid/dock.conf" <<EOF
+[Dock]
+Pinned=$(echo "$pinned" | tr -d ' ')
+DividersBefore=
+Magnification=true
+ShowRunning=false
+MaxScale=2
+Spread=6
+IconSize=0
+EOF
+
     # Its own XDG_CONFIG_HOME, for two reasons. Running this must not read or
     # write the developer's real ~/.config/lucid/dock.conf -- the dock writes
     # that file on first run. And the pinned list decides how many icons get
@@ -126,9 +160,8 @@ measure() {
     # that was being asked about.
     cat > "$WORK/sway.cfg" <<EOF
 output HEADLESS-1 resolution 1920x323
-exec_always env XDG_CONFIG_HOME=$WORK/config GSK_RENDERER=cairo $binary > $WORK/$procname.log 2>&1
+exec_always env XDG_CONFIG_HOME=$WORK/config XDG_DATA_HOME=$WORK/data XDG_DATA_DIRS=$WORK/data:/usr/share GSK_RENDERER=cairo $binary > $WORK/$procname.log 2>&1
 EOF
-    mkdir -p "$WORK/config"
     WLR_BACKENDS=headless sway -c "$WORK/sway.cfg" > "$WORK/sway.log" 2>&1 &
     SWAY_PID=$!
 
@@ -184,7 +217,7 @@ fi
 
 echo
 printf "  %-34s %8s MiB PSS\n" "empty GTK4 window (the floor)" "$floor"
-printf "  %-34s %8s MiB PSS\n" "lucid_dock_cpp" "$dock"
+printf "  %-34s %8s MiB PSS\n" "lucid_dock_cpp (8 pinned icons)" "$dock"
 printf "  %-34s %8s MiB\n"     "the dock's own cost" "$delta"
 printf "  %-34s %8s MiB\n"     "budget" "$BUDGET_MIB"
 echo

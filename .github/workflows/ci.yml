@@ -25,7 +25,7 @@ jobs:
             build-essential pkg-config \
             libgtk-4-dev libglib2.0-dev libwayland-dev libwayland-bin \
             meson ninja-build git ca-certificates \
-            sway
+            sway adwaita-icon-theme
 
       # Not packaged before Ubuntu 25.10, so 24.04 runners build it. Same
       # ~/.local prefix the README documents for a development host, and the
